@@ -1,0 +1,1756 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>弓箭肉鸽 · Roguelike</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { height:100%; background:#5a5250; color:#f3ece0;
+    font-family:"Baloo 2","Segoe UI Rounded","PingFang SC","Microsoft YaHei",sans-serif; }
+  #wrap { min-height:100%; display:flex; flex-direction:column; align-items:center;
+    justify-content:center; gap:12px; padding:16px; }
+  h1 { font-size:22px; font-weight:800; letter-spacing:1px; color:#e4d488;
+    text-shadow:1.5px 1.5px 0 #4a4038, -1px -1px 0 #4a4038; }
+  #game { background:#b9a58c; border:3px solid #4a4038; border-radius:10px;
+    box-shadow:5px 6px 0 rgba(74,64,56,.45); max-width:100%; height:auto;
+    cursor:crosshair; touch-action:none; }
+  .hint { font-size:13px; color:#e6dcc8; font-weight:600;
+    text-shadow:1px 1px 0 #4a4038; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <h1>🏹 弓箭肉鸽 · Roguelike</h1>
+  <canvas id="game" width="960" height="600"></canvas>
+  <div class="hint">移动 WASD · 弓箭自动锁敌连射 · 经验全屏自动吸 · 匕首周期旋转 · 武器满 5 级进化</div>
+</div>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+
+// ---------- 世界与镜头 ----------
+const WW = 30000, WH = 1300;   // 长路世界：沿路一关一关向右推进
+let cam = { x:0, y:0 };
+let time = 0;
+const clamp = (v,a,b) => Math.max(a, Math.min(b, v));
+const lerp = (a,b,t) => a + (b-a)*t;
+const hash = n => { const s = Math.sin(n*127.1)*43758.5453; return s-Math.floor(s); };
+
+// ===== 画风规范：美式手绘水彩（低饱和 + 斑驳纹理 + 细深棕描边 + 不规则形状）=====
+const INK = '#3b332b';                    // 深棕灰描边（非纯黑，手绘感，保证对比）
+const OUTLINE = (w)=>{ ctx.lineWidth=w||2.6; ctx.strokeStyle=INK; ctx.lineJoin='round'; ctx.lineCap='round'; };
+// 手绘抖动圆（平滑、边缘不规则）
+function wobbleCircle(cx,cy,r,seed,amp=0.07,seg=16){
+  const pts=[];
+  for(let i=0;i<seg;i++){
+    const a=i/seg*Math.PI*2;
+    const rr=r*(1 + Math.sin(a*3+seed)*amp + Math.sin(a*5-seed*1.7)*amp*0.55);
+    pts.push([cx+Math.cos(a)*rr, cy+Math.sin(a)*rr]);
+  }
+  ctx.beginPath();
+  ctx.moveTo((pts[0][0]+pts[seg-1][0])/2,(pts[0][1]+pts[seg-1][1])/2);
+  for(let i=0;i<seg;i++){
+    const p=pts[i], n=pts[(i+1)%seg];
+    ctx.quadraticCurveTo(p[0],p[1],(p[0]+n[0])/2,(p[1]+n[1])/2);
+  }
+  ctx.closePath();
+}
+// 物体表面斑点（预生成，避免每帧随机闪烁）
+function makeSpecks(n, spread, seed){
+  const arr=[];
+  for(let i=0;i<n;i++){
+    arr.push({ a:hash(seed+i*3.1)*Math.PI*2, d:Math.sqrt(hash(seed+i*7.7+1))*spread,
+               s:1.2+hash(seed+i*11.3+2)*2.8, t:hash(seed+i*13.9+3) });
+  }
+  return arr;
+}
+function drawSpecks(cx,cy,specks,c1,c2){
+  for(const s of specks){
+    ctx.fillStyle = s.t<0.5 ? c1 : c2;
+    const x=cx+Math.cos(s.a)*s.d, y=cy+Math.sin(s.a)*s.d;
+    ctx.beginPath(); ctx.ellipse(x,y,s.s,s.s*0.78,s.a,0,Math.PI*2); ctx.fill();
+  }
+}
+
+// ---------- 全局手绘纹理（纸张颗粒 + 水彩斑驳 + 短笔触）----------
+let grainPat=null, blotPat=null;
+function makeTextures(){
+  // 1) 细颗粒噪点
+  const c1=document.createElement('canvas'); c1.width=c1.height=256;
+  const g1=c1.getContext('2d');
+  const im=g1.createImageData(256,256);
+  for(let i=0;i<im.data.length;i+=4){
+    const r=Math.random();
+    if(r<0.42){ im.data[i]=im.data[i+1]=im.data[i+2]=45; im.data[i+3]=Math.random()*30; }
+    else if(r<0.78){ im.data[i]=im.data[i+1]=im.data[i+2]=250; im.data[i+3]=Math.random()*22; }
+    else { im.data[i]=im.data[i+1]=im.data[i+2]=130; im.data[i+3]=Math.random()*14; }
+  }
+  g1.putImageData(im,0,0);
+  grainPat=ctx.createPattern(c1,'repeat');
+
+  // 2) 水彩晕染斑驳 + 短笔触
+  const c2=document.createElement('canvas'); c2.width=c2.height=512;
+  const g2=c2.getContext('2d');
+  for(let i=0;i<170;i++){
+    const x=Math.random()*512, y=Math.random()*512, r=18+Math.random()*95;
+    const dark=Math.random()<0.5;
+    const gr=g2.createRadialGradient(x,y,0,x,y,r);
+    gr.addColorStop(0, dark?'rgba(70,58,44,0.10)':'rgba(255,250,232,0.12)');
+    gr.addColorStop(1,'rgba(0,0,0,0)');
+    g2.fillStyle=gr; g2.beginPath(); g2.arc(x,y,r,0,Math.PI*2); g2.fill();
+  }
+  g2.lineCap='round';
+  for(let i=0;i<240;i++){
+    const x=Math.random()*512, y=Math.random()*512, l=4+Math.random()*17, a=Math.random()*Math.PI;
+    g2.strokeStyle=Math.random()<0.5?'rgba(70,58,44,0.08)':'rgba(255,250,232,0.10)';
+    g2.lineWidth=1+Math.random()*2.2;
+    g2.beginPath(); g2.moveTo(x,y); g2.lineTo(x+Math.cos(a)*l, y+Math.sin(a)*l); g2.stroke();
+  }
+  blotPat=ctx.createPattern(c2,'repeat');
+}
+
+// ---------- 输入 ----------
+const keys = {};
+const mouse = { x: W/2, y: H/2 };
+canvas.addEventListener('mousemove', e => {
+  const r = canvas.getBoundingClientRect();
+  mouse.x = (e.clientX - r.left) * (W / r.width);
+  mouse.y = (e.clientY - r.top) * (H / r.height);
+});
+window.addEventListener('keydown', e => {
+  keys[e.key.toLowerCase()] = true;
+  if(state==='start' && (e.key===' '||e.key==='Enter')) startGame();
+  if(state==='gameover' && (e.key===' '||e.key==='Enter')) startGame();
+});
+window.addEventListener('keyup', e => keys[e.key.toLowerCase()] = false);
+canvas.addEventListener('click', handleClick);
+canvas.addEventListener('touchstart', e => { e.preventDefault(); handleClick(); }, {passive:false});
+
+// ---------- 词条（只保留武器相关）----------
+const UPGRADES = [
+  { id:'dmg',    cat:'global', name:'强击',     desc:'全武器伤害 +20%',      apply:p=>p.dmgMul*=1.2 },
+  { id:'dmg200', cat:'bow',    name:'伤害+200%', desc:'箭伤变为 3 倍',        rare:true, weight:0.35,
+    apply:p=>p.weapon.damage*=3 },
+  { id:'dmg500', cat:'bow',    name:'伤害+500%', desc:'箭伤变为 6 倍',        rare:true, weight:0.15,
+    apply:p=>p.weapon.damage*=6 },
+  { id:'crit',   cat:'global', name:'暴击率',   desc:'暴击率 +8%',           apply:p=>p.critRate+=0.08 },
+  { id:'cdmg',   cat:'global', name:'暴击效果', desc:'暴击伤害 +25%',        apply:p=>p.critDmg+=0.25 },
+  { id:'burst',  cat:'bow',    name:'连发',     desc:'每轮连射 +1 支',       apply:p=>p.weapon.burst+=1 },
+  { id:'burst2', cat:'bow',    name:'连发 ×2',  desc:'连射数 ×2 · 上限 15', rare:true, weight:0.5,
+    apply:p=>p.weapon.burst=Math.min(15, Math.max(p.weapon.burst*2, 2)) },
+  { id:'burst3', cat:'bow',    name:'连发 ×3',  desc:'连射数 ×3 · 上限 15', rare:true, weight:0.22,
+    apply:p=>p.weapon.burst=Math.min(15, Math.max(p.weapon.burst*3, 3)) },
+  { id:'rate',   cat:'bow',    name:'急速射击', desc:'射击间隔 -15%',        apply:p=>p.weapon.cooldown*=0.85 },
+  { id:'pierce', cat:'bow',    name:'穿透',     desc:'箭矢穿透 +1',          apply:p=>p.weapon.pierce+=1 },
+  { id:'count',  cat:'bow',    name:'箭矢数量', desc:'每次发射 +1 支（扇形展开）', apply:p=>p.weapon.count+=1 },
+  { id:'count2', cat:'bow',    name:'数量+2',   desc:'每次发射 +2 支（扇形展开）', rare:true, weight:0.55,
+    apply:p=>p.weapon.count+=2 },
+  { id:'count3', cat:'bow',    name:'数量+3',   desc:'每次发射 +3 支（扇形展开）', rare:true, weight:0.4,
+    apply:p=>p.weapon.count+=3 },
+  { id:'count4', cat:'bow',    name:'数量+4',   desc:'每次发射 +4 支（扇形展开）', rare:true, weight:0.3,
+    apply:p=>p.weapon.count+=4 },
+  { id:'split',  cat:'bow',    name:'分裂',     desc:'命中后分裂出 2 支碎片箭', apply:p=>p.weapon.split+=2 },
+  { id:'aspd',   cat:'bow',    name:'攻速',     desc:'射击间隔 -18%',        apply:p=>p.weapon.cooldown*=0.82 },
+  { id:'homing', cat:'bow',    name:'精准',     desc:'箭矢自动追踪目标 · 射程 +80', weight:0.8,
+    apply:p=>{ p.homing=true; p.range+=80; } },
+  { id:'dcount', cat:'dagger', name:'匕首+1',   desc:'匕首数量 +1',          apply:p=>p.weapon.daggers.count+=1 },
+  { id:'dspin',  cat:'dagger', name:'疾旋',     desc:'匕首转速 +30%',        apply:p=>p.weapon.daggers.spin*=1.3 },
+  { id:'dsize',  cat:'dagger', name:'巨刃',     desc:'匕首体积 +25%',        apply:p=>p.weapon.daggers.size*=1.25 },
+  { id:'ddur',   cat:'dagger', name:'持久',     desc:'匕首持续时间 +1.5s',   apply:p=>p.weapon.daggers.duration+=1.5 },
+];
+
+const ENEMY_TYPES = {
+  grunt:  { color:'#d99fbf', hp:18, speed:34,  radius:15, damage:6  },
+  rusher: { color:'#e0a07c', hp:9,  speed:66,  radius:12, damage:4  },
+  brute:  { color:'#b9a3d4', hp:45, speed:24,  radius:24, damage:10 },
+};
+
+// ---------- 游戏状态 ----------
+let state = 'start';
+let game = null;
+let player = null;
+
+// ---------- 长路 + 主题场景 ----------
+const ROAD_W = 96;                        // 路宽（弱化后）
+const SEG = 3000;                         // 每个场景区段长度
+function roadY(x){                        // 蜿蜒路中心线
+  return WH/2 + Math.sin(x*0.0011 + game.roadPh1)*300 + Math.sin(x*0.00047 + game.roadPh2)*140;
+}
+function riverX(r, y){                    // 河流中心线（x 关于 y）
+  return r.base + Math.sin(y*0.006 + r.ph)*90 + Math.sin(y*0.0023 + r.ph*2)*50;
+}
+// 场景主题（循环使用）：底色 / 斑块色板 / 植被权重 / 河水色
+const SCENES = [
+  { name:'青草平原', ground:'#b3a884', patches:['#9fae90','#a8b48e','#bcc49c','#a0ab94'],
+    river:'#7fb2c9', flora:['grass','grass','grass','flower','flower','bush','tree','rock'] },
+  { name:'迷雾森林', ground:'#8e9a80', patches:['#7d8f72','#8fa084','#6f8266','#93a388'],
+    river:'#6a9aa8', flora:['tree','tree','tree','tree','bush','bush','grass','mushroom'] },
+  { name:'荒石峡谷', ground:'#b0a190', patches:['#a3937f','#b7a78f','#978673','#c0b09a'],
+    river:'#8fa8b5', flora:['rock','rock','rock','tree','grass','bush'] },
+  { name:'绯红沼泽', ground:'#a08a7c', patches:['#8f7568','#a58a7a','#7c6a5e','#b09484'],
+    river:'#7a9a8a', flora:['mushroom','mushroom','bush','bush','grass','tree','flower'] },
+  { name:'灰烬高地', ground:'#96887e', patches:['#857870','#a29488','#776c64','#ad9f92'],
+    river:'#7d95a0', flora:['rock','rock','tree','bush','grass','rock'] },
+  { name:'暮色荒原', ground:'#a89a8e', patches:['#98897c','#b5a696','#867a70','#c0b1a0'],
+    river:'#8aa3b0', flora:['tree','rock','bush','grass','flower','mushroom'] },
+];
+const sceneIdx = i => (((i-1) % SCENES.length) + SCENES.length) % SCENES.length;  // 第 i 关(1起)的主题
+// 第 i 场景的入口（传送落点，路北侧）
+function sceneEntry(i){ const x=(i-1)*SEG+260; return { x, y:roadY(x)-86 }; }
+// 第 i 场景末端的传送阵（路南侧）
+function portalPos(i){ const x=i*SEG-240; return { x, y:roadY(x)+86 }; }
+
+function startGame(){
+  player = {
+    x:WW/2, y:WH/2, radius:15, hp:100, maxHp:100, speed:210,
+    daggerAngle:0, shotsLeft:0, fireFlash:0, hitFlash:0, bob:0,
+    dmgMul:1, critRate:0.05, critDmg:1.5,
+    weapon:{
+      damage:10, cooldown:0.6, arrowSpeed:520, burst:1, pierce:0, count:1, split:0,
+      level:1, evolved:false,
+      daggers:{ count:1, spin:2.2, size:11, orbit:50, damage:8,
+                duration:4, interval:3, active:true, timer:4,
+                level:1, evolved:false },
+    },
+    fireTimer:0, aimTarget:null, aimAng:0, hidden:false, range:330, homing:false,
+    specks: makeSpecks(14, 11, 3.7),
+  };
+  game = {
+    floor:0, level:1, xp:0, xpNeed:20, kills:0, score:0, shake:0, cleared:false,
+    enemies:[], arrows:[], orbs:[], particles:[], texts:[], rings:[], embers:[], bushes:[],
+    patches:[], blots:[], tiles:[], decor:[], roadStones:[], rivers:[],
+    roadPh1:Math.random()*6.28, roadPh2:Math.random()*6.28,
+    sceneMsg:'', sceneTimer:0,
+    spawnTimer:0, evoMsg:'', evoTimer:0,
+    upgradeChoices:[], upgradeRects:[], quota:0, slain:0,
+  };
+  for(let i=0;i<70;i++){
+    game.embers.push({
+      x:Math.random()*WW, y:Math.random()*WH,
+      vy:-(4+Math.random()*8), r:0.8+Math.random()*1.8,
+      ph:Math.random()*Math.PI*2, hue:Math.random()<0.5?'#efe0a8':'#cfe0d8',
+    });
+  }
+  generateWorld();
+  startFloor();
+  // 出生在第 1 场景入口旁的路面上
+  player.x = sceneEntry(1).x + 30; player.y = roadY(sceneEntry(1).x);
+  game.sceneMsg = SCENES[0].name; game.sceneTimer = 2.6;
+  state = 'playing';
+}
+
+function generateWorld(){
+  // 地面色块（按所在场景取色板）
+  game.patches = [];
+  for(let i=0;i<620;i++){
+    const x=Math.random()*WW, y=Math.random()*WH;
+    const sc=SCENES[sceneIdx(Math.floor(x/SEG)+1)];
+    game.patches.push({
+      x, y,
+      rx:40+Math.random()*85, ry:30+Math.random()*60,
+      c:sc.patches[Math.floor(Math.random()*sc.patches.length)],
+      a:0.30+Math.random()*0.25, rot:Math.random()*Math.PI, seed:Math.random()*10,
+    });
+  }
+  // 水彩晕染斑块（柔和脏细节）
+  game.blots = [];
+  for(let i=0;i<220;i++){
+    game.blots.push({ x:Math.random()*WW, y:Math.random()*WH, r:70+Math.random()*170,
+      dark:Math.random()<0.55, a:0.025+Math.random()*0.045 });
+  }
+  // 淡淡的地面裂纹 / 砖缝（低饱和细线）
+  game.tiles = [];
+  for(let i=0;i<150;i++){
+    const x=Math.random()*WW, y=Math.random()*WH, len=40+Math.random()*110, a=Math.random()*Math.PI;
+    game.tiles.push({ x,y,len,a, ph:Math.random()*10 });
+  }
+  // 河流：每场景 1~2 条蜿蜒河，与路交叉处预计算桥点
+  game.rivers = [];
+  for(let s=1; s<=Math.ceil(WW/SEG); s++){
+    const n = Math.random()<0.7 ? 1 : 2;
+    for(let k=0;k<n;k++){
+      const r = { base:(s-1)*SEG + 500 + Math.random()*(SEG-1100),
+        ph:Math.random()*6.28, w:55+Math.random()*35, seg:s-1, crossings:[] };
+      for(let y=30;y<WH-30;y+=8){
+        const x = riverX(r,y);
+        if(Math.abs(roadY(x)-y) < 16) r.crossings.push({ x, y:roadY(x) });
+      }
+      r.crossings = r.crossings.filter((c,idx)=> idx===0 ||
+        Math.hypot(c.x-r.crossings[idx-1].x, c.y-r.crossings[idx-1].y) > 90);
+      game.rivers.push(r);
+    }
+  }
+  // 装饰物（32% 长在河岸边，其余按场景植被分布；避开路面）
+  game.decor = [];
+  for(let i=0;i<460;i++){
+    let x,y,type;
+    const riverside = Math.random()<0.32 && game.rivers.length;
+    if(riverside){
+      const r = game.rivers[Math.floor(Math.random()*game.rivers.length)];
+      y = 120+Math.random()*(WH-240);
+      x = clamp(riverX(r,y) + (Math.random()<0.5?-1:1)*(r.w/2+26+Math.random()*80), 60, WW-60);
+      if(Math.abs(y-roadY(x))<90){ i--; continue; }
+    } else if(Math.random()<0.42){
+      const s = Math.floor(Math.random()*4);
+      if(s===0){ x=Math.random()*WW; y=Math.random()*200; }
+      else if(s===1){ x=Math.random()*WW; y=WH-Math.random()*200; }
+      else if(s===2){ x=Math.random()*200; y=Math.random()*WH; }
+      else { x=WW-Math.random()*200; y=Math.random()*WH; }
+      type = Math.random()<0.6 ? 'tree' : (Math.random()<0.5?'bush':'rock');
+    } else {
+      x=200+Math.random()*(WW-400);
+      let tries=0;
+      do{ y=120+Math.random()*(WH-240); tries++; } while(Math.abs(y-roadY(x))<100 && tries<8);
+    }
+    if(!type){
+      const sc = SCENES[sceneIdx(Math.floor(x/SEG)+1)];
+      type = sc.flora[Math.floor(Math.random()*sc.flora.length)];
+    }
+    game.decor.push({ x, y, type, s:0.7+Math.random()*0.6, ph:Math.random()*3,
+      seed:Math.random()*20, specks:makeSpecks(7, 20, Math.random()*50) });
+  }
+
+  // 边框斑驳（预生成，避免每帧随机闪烁）
+  game.borderSpecks = [];
+  for(let i=0;i<420;i++){
+    let x=Math.random()*WW, y=Math.random()*WH;
+    const s=Math.floor(Math.random()*4);
+    if(s===0) y=Math.random()*24; else if(s===1) y=WH-Math.random()*24;
+    else if(s===2) x=Math.random()*24; else x=WW-Math.random()*24;
+    game.borderSpecks.push({ x, y, rx:6+Math.random()*20, ry:4+Math.random()*12,
+      rot:Math.random(), dark:Math.random()<0.5 });
+  }
+
+  // 路面石子 + 车辙点（沿路散布）
+  game.roadStones = [];
+  for(let x=60; x<WW-60; x+=64){
+    const cy=roadY(x);
+    const n=2+Math.floor(Math.random()*2);
+    for(let k=0;k<n;k++){
+      game.roadStones.push({ x:x+Math.random()*40-20, y:cy+(Math.random()*96-48),
+        s:1.6+Math.random()*3.4, dark:Math.random()<0.5 });
+    }
+  }
+
+  // 可躲藏草丛：沿路两侧分布，避开出生点
+  game.bushes = [];
+  const nb = 16 + Math.floor(Math.random()*5);
+  for(let i=0;i<nb;i++){
+    let bx, by, tries=0;
+    do{
+      bx = 400 + Math.random()*(WW-800);
+      by = roadY(bx) + (Math.random()<0.5?-1:1)*(110 + Math.random()*170);
+      tries++;
+    } while(Math.hypot(bx-sceneEntry(1).x, by-roadY(sceneEntry(1).x)) < 260 && tries<30);
+    const r = 72 + Math.random()*46;
+    // 云朵状大叶球（聚成一坨草丛，而不是散落的小叶片）
+    const lobes=[], ln=5+Math.floor(Math.random()*3);
+    for(let j=0;j<ln;j++){
+      lobes.push({ a:(j/ln)*Math.PI*2 + Math.random()*0.4,
+        d:0.28+Math.random()*0.26, r:r*(0.30+Math.random()*0.15),
+        tone:j%2, ph:Math.random()*6.28 });
+    }
+    game.bushes.push({ x:bx, y:by, r, ph:Math.random()*Math.PI*2,
+      lobes, clumps: makeBushClumps(r), specks:makeSpecks(16, r*0.85, Math.random()*60) });
+  }
+}
+
+function makeBushClumps(r){
+  const arr = [];
+  const n = Math.max(11, Math.round(r/9));
+  for(let i=0;i<n;i++){
+    arr.push({ a:(i/n)*Math.PI*2 + Math.random()*0.22, d:0.7+Math.random()*0.3,
+      s:13+Math.random()*7, tone:i%2, ph:Math.random()*6.28, inner:false });
+  }
+  for(let i=0;i<5;i++){
+    arr.push({ a:Math.random()*Math.PI*2, d:Math.random()*0.5, s:12+Math.random()*6,
+      tone:i%2, ph:Math.random()*6.28, inner:true });
+  }
+  return arr;
+}
+
+function startFloor(){
+  game.floor++;
+  game.quota = 16 + game.floor * 5;   // 本场景需击杀数（杀满激活传送阵）
+  game.slain = 0;
+  game.spawnTimer = 0;
+  game.cleared = false;
+  // 跨场景保留经验球（继续飞向经验条），只清战斗实体
+  game.enemies = []; game.arrows = []; game.particles = []; game.texts = []; game.rings = [];
+}
+
+// 传送阵：传送到下一场景入口，播场景名横幅
+function teleport(){
+  const next = game.floor + 1;
+  const dest = sceneEntry(next);
+  spawnParticles(player.x, player.y, '#e8dcc0', 22, 1.6);
+  game.rings.push({ x:player.x, y:player.y, r:10, max:150, life:0.5, color:'#e8dcc0' });
+  player.x = dest.x; player.y = dest.y;
+  spawnParticles(dest.x, dest.y, '#e8dcc0', 22, 1.6);
+  game.rings.push({ x:dest.x, y:dest.y, r:10, max:170, life:0.55, color:'#e8dcc0' });
+  game.shake = 10;
+  startFloor();
+  // 传送补给：回复 35% 最大生命（怪强度指数增长下的生存补偿）
+  player.hp = Math.min(player.maxHp, player.hp + player.maxHp*0.35);
+  floatText('+'+Math.round(player.maxHp*0.35), player.x, player.y-24, '#8fc46a', 16);
+  game.sceneMsg = SCENES[sceneIdx(game.floor)].name;
+  game.sceneTimer = 2.6;
+}
+
+// ---------- 刷怪：独居单只 / 群居一窝，环形散布在玩家四周 ----------
+function pickType(floor){
+  let type = 'grunt'; const r = Math.random();
+  if(floor>=2 && r<0.35) type = 'rusher';
+  if(floor>=3 && r>0.80) type = 'brute';
+  return type;
+}
+// 环形散布：以玩家为中心，距离 320~780 随机方向（近处钻地淡入，远处视野外）
+function spawnPos(minD, maxD){
+  const a = Math.random()*Math.PI*2, d = minD + Math.random()*(maxD-minD);
+  return { x:clamp(player.x + Math.cos(a)*d, 30, WW-30), y:clamp(player.y + Math.sin(a)*d, 30, WH-30) };
+}
+function makeEnemy(type, x, y){
+  const base = ENEMY_TYPES[type];
+  const f = game.floor-1;
+  // 血量十倍涨：第 1 关 grunt≈20，第 2 关 200，之后每关 ×10（用户指定）
+  const hpScale = Math.pow(10, f) * 1.1;
+  const dmgScale = Math.pow(1.2, f);                 // 伤害指数但温和（玩家靠传送回血补给）
+  const speed = base.speed + f*4;                    // 速度渐增
+  game.enemies.push({
+    type, x, y, radius:base.radius, color:base.color,
+    hp:base.hp*hpScale, maxHp:base.hp*hpScale,
+    speed, damage:base.damage*dmgScale, attackTimer:0, daggerCd:0,
+    hitFlash:0, dead:false, phase:Math.random()*Math.PI*2,
+    wandering:false, wanderTimer:Math.random()*1.5, wx:0, wy:0,
+    seed:Math.random()*30, specks:makeSpecks(9, base.radius*0.8, Math.random()*70),
+    spawnT:0.55,                                     // 钻地淡入（期间不动不打不被打）
+  });
+  spawnParticles(x, y, '#c9b89a', 6, 0.5);           // 出生尘土
+}
+// 独居：单只散布
+function spawnEnemy(){
+  const p = spawnPos(320, 780);
+  makeEnemy(pickType(game.floor), p.x, p.y);
+}
+// 群居：一窝 3~6 只（随场景略增）围在同一个巢点附近
+function spawnGroup(){
+  const p = spawnPos(380, 780);
+  const type = pickType(game.floor);
+  const n = 3 + Math.floor(Math.random()*4) + Math.floor(game.floor/3);
+  for(let k=0;k<n;k++){
+    const a = Math.random()*Math.PI*2, dd = 18 + Math.random()*72;
+    makeEnemy(type, clamp(p.x+Math.cos(a)*dd, 20, WW-20), clamp(p.y+Math.sin(a)*dd, 20, WH-20));
+  }
+}
+
+function shoot(tx,ty){
+  const baseAng = Math.atan2(ty-player.y, tx-player.x);
+  player.aimAng = baseAng;
+  player.fireFlash = 0.07;
+  const n = player.weapon.count;
+  for(let i=0;i<n;i++){
+    const spread = (n>1) ? (i - (n-1)/2) * 0.16 : 0;
+    const ang = baseAng + spread;
+    game.arrows.push({
+      x:player.x + Math.cos(ang)*player.radius, y:player.y + Math.sin(ang)*player.radius,
+      vx:Math.cos(ang)*player.weapon.arrowSpeed,
+      vy:Math.sin(ang)*player.weapon.arrowSpeed,
+      radius:4, damage:player.weapon.damage, pierce:player.weapon.pierce,
+      split:player.weapon.split,
+      target: player.homing ? player.aimTarget : null,   // 精准：箭追踪锁定目标
+      life:1.6, color: player.weapon.evolved ? '#c86a52' : '#c9a86a',
+    });
+  }
+}
+
+function killEnemy(e){
+  e.dead = true;
+  game.kills++; game.score += 10;
+  game.slain++;
+  game.orbs.push({ x:e.x, y:e.y, radius:5, value:6, phase:Math.random()*Math.PI*2 });
+  spawnParticles(e.x, e.y, e.color, 16, 1.5);
+  game.rings.push({ x:e.x, y:e.y, r:e.radius, max:e.radius*3.5, life:0.45, color:e.color });
+}
+
+function spawnParticles(x,y,color,n,spd=1){
+  for(let i=0;i<n;i++){
+    const a = Math.random()*Math.PI*2, s = (40+Math.random()*130)*spd;
+    game.particles.push({ x, y, vx:Math.cos(a)*s, vy:Math.sin(a)*s, life:0.4+Math.random()*0.3, color });
+  }
+}
+function floatText(text,x,y,color,size){
+  game.texts.push({ text, x, y, color, size:size||14, life:0.7, vy:-45 });
+}
+function dealDamage(e, base, hx, hy){
+  const crit = Math.random() < player.critRate;
+  const dmg = base * player.dmgMul * (crit ? player.critDmg : 1);
+  e.hp -= dmg;
+  e.hitFlash = 0.09;
+  const dmgInt = Math.round(dmg);
+  if(crit) floatText(dmgInt, hx, hy-6, '#f0d066', 20);
+  else floatText(dmgInt, hx, hy-6, '#fff6e2', 13);
+  spawnParticles(hx, hy, crit ? '#f0d066' : '#f3ece0', crit ? 8 : 4);
+  if(e.hp <= 0 && !e.dead) killEnemy(e);
+}
+function checkEvolution(){
+  const w = player.weapon, d = w.daggers;
+  if(w.level>=5 && !w.evolved){
+    w.evolved = true;
+    player.dmgMul *= 1.6; w.damage *= 1.3; w.burst += 2; w.pierce += 2; w.arrowSpeed *= 1.3;
+    game.evoMsg = '弓箭进化 · 风暴箭！'; game.evoTimer = 2.8; game.shake = 14;
+    game.rings.push({ x:player.x, y:player.y, r:20, max:320, life:0.7, color:'#c86a52' });
+  }
+  if(d.level>=5 && !d.evolved){
+    d.evolved = true;
+    d.count += 3; d.spin *= 1.5; d.size *= 1.4; d.damage *= 1.6; d.orbit += 18;
+    d.duration += 3; d.interval *= 0.6;
+    game.evoMsg = '匕首进化 · 环刃风暴！'; game.evoTimer = 2.8; game.shake = 14;
+    game.rings.push({ x:player.x, y:player.y, r:20, max:320, life:0.7, color:'#e0c86a' });
+  }
+}
+function pickUpgrades(){
+  // 加权抽取（weight 越小越稀有），不重复
+  const pool = UPGRADES.slice();
+  const out = [];
+  for(let i=0;i<3 && pool.length;i++){
+    let total=0; for(const u of pool) total += (u.weight||1);
+    let r=Math.random()*total, idx=pool.length-1;
+    for(let j=0;j<pool.length;j++){ r -= (pool[j].weight||1); if(r<=0){ idx=j; break; } }
+    out.push(pool.splice(idx,1)[0]);
+  }
+  return out;
+}
+function handleClick(){
+  if(state==='start'){ startGame(); return; }
+  if(state==='gameover'){ startGame(); return; }
+  if(state==='upgrade'){
+    for(const rect of game.upgradeRects){
+      if(mouse.x>=rect.x && mouse.x<=rect.x+rect.w && mouse.y>=rect.y && mouse.y<=rect.y+rect.h){
+        rect.up.apply(player);
+        if(rect.up.cat==='bow'){ player.weapon.level++; checkEvolution(); }
+        else if(rect.up.cat==='dagger'){ player.weapon.daggers.level++; checkEvolution(); }
+        game.shake = 6;
+        state = 'playing';
+        return;
+      }
+    }
+  }
+}
+
+// ---------- 更新 ----------
+function update(dt){
+  if(state!=='playing') return;
+  time += dt;
+
+  cam.x = clamp(player.x - W/2, 0, WW-W);
+  cam.y = clamp(player.y - H/2, 0, WH-H);
+
+  if(game.shake>0) game.shake = Math.max(0, game.shake - dt*40);
+  if(game.evoTimer>0) game.evoTimer -= dt;
+  if(game.sceneTimer>0) game.sceneTimer -= dt;
+  if(player.fireFlash>0) player.fireFlash -= dt;
+  if(player.hitFlash>0) player.hitFlash -= dt;
+
+  let dx=0, dy=0;
+  if(keys['w']||keys['arrowup'])    dy-=1;
+  if(keys['s']||keys['arrowdown'])  dy+=1;
+  if(keys['a']||keys['arrowleft'])  dx-=1;
+  if(keys['d']||keys['arrowright']) dx+=1;
+  if(dx||dy){ const len=Math.hypot(dx,dy); dx/=len; dy/=len; }
+  player.x = clamp(player.x + dx*player.speed*dt, player.radius, WW-player.radius);
+  player.y = clamp(player.y + dy*player.speed*dt, player.radius, WH-player.radius);
+  player.bob += dt;
+
+  player.hidden = false;
+  for(const b of game.bushes){
+    if(Math.hypot(player.x-b.x, player.y-b.y) < b.r){ player.hidden = true; break; }
+  }
+
+  // 锁定攻击范围内最近的敌人；隐蔽时不攻击（不射击、不消耗冷却）
+  let target=null, best=Infinity;
+  for(const e of game.enemies){
+    if(e.dead || e.spawnT>0) continue;
+    const d = Math.hypot(e.x-player.x, e.y-player.y);
+    if(d<best && d<=player.range){ best=d; target=e; }
+  }
+  player.aimTarget = target;
+  if(target){
+    player.aimAng = Math.atan2(target.y-player.y, target.x-player.x);
+    if(!player.hidden){
+      player.fireTimer -= dt;
+      if(player.fireTimer<=0){
+        if(player.shotsLeft<=0) player.shotsLeft = player.weapon.burst;
+        shoot(target.x, target.y);
+        player.shotsLeft--;
+        player.fireTimer = player.shotsLeft>0 ? 0.08 : player.weapon.cooldown;
+      }
+    }
+  }
+
+  for(let i=game.arrows.length-1;i>=0;i--){
+    const a = game.arrows[i];
+    a.x += a.vx*dt; a.y += a.vy*dt; a.life -= dt;
+    // 精准词条：箭朝锁定目标缓慢转向（目标死亡则直飞）
+    if(a.target && !a.target.dead){
+      const ta = Math.atan2(a.target.y-a.y, a.target.x-a.x);
+      let da = ta - Math.atan2(a.vy,a.vx);
+      while(da > Math.PI) da -= Math.PI*2;
+      while(da < -Math.PI) da += Math.PI*2;
+      const turn = clamp(da, -4.2*dt, 4.2*dt);      // 每秒最多转 4.2 弧度
+      const sp2 = Math.hypot(a.vx,a.vy);
+      const na = Math.atan2(a.vy,a.vx) + turn;
+      a.vx = Math.cos(na)*sp2; a.vy = Math.sin(na)*sp2;
+    }
+    let remove = false;
+    for(const e of game.enemies){
+      if(e.dead || e.spawnT>0) continue;
+      if(Math.hypot(a.x-e.x, a.y-e.y) < e.radius + a.radius){
+        dealDamage(e, a.damage, a.x, a.y);
+        if(a.split>0){
+          for(let s=0;s<a.split;s++){
+            const sang = Math.atan2(a.vy,a.vx) + (s-(a.split-1)/2)*0.5 + (s%2?0.4:-0.4);
+            game.arrows.push({
+              x:a.x, y:a.y,
+              vx:Math.cos(sang)*player.weapon.arrowSpeed*0.8,
+              vy:Math.sin(sang)*player.weapon.arrowSpeed*0.8,
+              radius:3, damage:a.damage*0.6, pierce:0, split:0,
+              life:0.8, color: player.weapon.evolved ? '#c86a52' : '#c9a86a',
+            });
+          }
+        }
+        if(a.pierce>0) a.pierce--; else { remove = true; break; }
+      }
+    }
+    if(remove || a.life<=0 || a.x<-30||a.x>WW+30||a.y<-30||a.y>WH+30) game.arrows.splice(i,1);
+  }
+
+  const dg = player.weapon.daggers;
+  if(dg.count>0){
+    dg.timer -= dt;
+    if(dg.timer<=0){
+      dg.active = !dg.active;
+      dg.timer = dg.active ? dg.duration : dg.interval;
+      game.rings.push({ x:player.x, y:player.y, r:dg.orbit-dg.size, max:dg.orbit+dg.size*2,
+        life:0.3, color: dg.active ? (dg.evolved?'#e0c86a':'#8fb0b8') : '#9a9a92' });
+    }
+    player.daggerAngle += dg.spin*dt;
+    if(dg.active && !player.hidden){
+      for(let i=0;i<dg.count;i++){
+        const a = player.daggerAngle + i*(Math.PI*2/dg.count);
+        const px = player.x + Math.cos(a)*dg.orbit;
+        const py = player.y + Math.sin(a)*dg.orbit;
+        for(const e of game.enemies){
+          if(e.dead || e.daggerCd>0 || e.spawnT>0) continue;
+          if(Math.hypot(px-e.x, py-e.y) < e.radius + dg.size){
+            e.daggerCd = 0.35;
+            dealDamage(e, dg.damage, px, py);
+          }
+        }
+      }
+    }
+  }
+
+  for(const e of game.enemies){
+    if(e.dead) continue;
+    if(e.daggerCd>0) e.daggerCd -= dt;
+    if(e.hitFlash>0) e.hitFlash -= dt;
+    // 钻地淡入期间：不移动、不攻击（从土里冒出来）
+    if(e.spawnT>0){ e.spawnT -= dt; continue; }
+    const ex=player.x-e.x, ey=player.y-e.y, d=Math.hypot(ex,ey)||1;
+    if(player.hidden){
+      e.wanderTimer -= dt;
+      if(e.wanderTimer<=0){
+        if(e.wandering){ e.wandering=false; e.wanderTimer=0.8+Math.random()*1.6; }
+        else { e.wandering=true; const wa=Math.random()*Math.PI*2; e.wx=Math.cos(wa); e.wy=Math.sin(wa); e.wanderTimer=0.35+Math.random()*0.5; }
+      }
+      if(e.wandering){ e.x += e.wx*e.speed*0.35*dt; e.y += e.wy*e.speed*0.35*dt; }
+      e.attackTimer = Math.max(e.attackTimer, 0.25);
+    } else {
+      e.x += ex/d*e.speed*dt; e.y += ey/d*e.speed*dt;
+      e.attackTimer -= dt;
+      if(d < e.radius+player.radius && e.attackTimer<=0){
+        player.hp -= e.damage; e.attackTimer = 0.5;
+        player.hitFlash = 0.25; game.shake = Math.max(game.shake, 8);
+        spawnParticles(player.x, player.y, '#c86a62', 8);
+      }
+    }
+    e.x = clamp(e.x, e.radius, WW-e.radius);
+    e.y = clamp(e.y, e.radius, WH-e.radius);
+  }
+  game.enemies = game.enemies.filter(e=>!e.dead);
+
+  const barSX = 141, barSY = 47;
+  const barWX = barSX + cam.x, barWY = barSY + cam.y;
+  for(let i=game.orbs.length-1;i>=0;i--){
+    const o = game.orbs[i];
+    const a = Math.atan2(barWY-o.y, barWX-o.x);
+    o.x += Math.cos(a)*460*dt; o.y += Math.sin(a)*460*dt;
+    if(Math.hypot(o.x-barWX, o.y-barWY) < 14){ game.xp += o.value; game.orbs.splice(i,1); }
+  }
+
+  for(let i=game.particles.length-1;i>=0;i--){
+    const p=game.particles[i]; p.x+=p.vx*dt; p.y+=p.vy*dt; p.life-=dt;
+    if(p.life<=0) game.particles.splice(i,1);
+  }
+  for(let i=game.texts.length-1;i>=0;i--){
+    const t=game.texts[i]; t.y+=t.vy*dt; t.life-=dt;
+    if(t.life<=0) game.texts.splice(i,1);
+  }
+  for(let i=game.rings.length-1;i>=0;i--){
+    const r=game.rings[i]; r.life-=dt; r.r=lerp(r.max,r.r,0.82);
+    if(r.life<=0) game.rings.splice(i,1);
+  }
+  for(const em of game.embers){
+    em.y+=em.vy*dt; em.ph+=dt*2;
+    if(em.y<-5){ em.y=WH+5; em.x=Math.random()*WW; }
+  }
+
+  // 持续刷怪：只要场上未达密度上限就不断补充（杀满配额后也继续刷，路上永远有怪）
+  {
+    game.spawnTimer-=dt;
+    const cap = 24 + game.floor*4;
+    if(game.spawnTimer<=0 && game.enemies.length < cap){
+      // 42% 群居（一窝 3~6 只），58% 独居（单只散布）
+      if(Math.random()<0.42) spawnGroup();
+      else spawnEnemy();
+      game.spawnTimer=0.32;
+    }
+  }
+  if(game.xp>=game.xpNeed){
+    game.level++; game.xp-=game.xpNeed;
+    game.xpNeed=Math.floor(20+game.level*12+game.level*game.level*2);
+    state='upgrade'; game.upgradeChoices=pickUpgrades(); game.shake=5;
+  }
+  // 场景推进：杀满击杀配额 → 传送阵激活 → 站上传送进入下一场景
+  if(!game.cleared && game.slain >= game.quota){
+    game.cleared = true;
+    const pp = portalPos(game.floor);
+    game.rings.push({ x:pp.x, y:pp.y, r:20, max:130, life:0.6, color:'#e8dcc0' });
+  }
+  if(game.cleared){
+    const pp = portalPos(game.floor);
+    if(Math.hypot(player.x-pp.x, player.y-pp.y) < 48) teleport();
+  }
+  if(player.hp<=0){ player.hp=0; state='gameover'; }
+}
+
+// ---------- 渲染 ----------
+function inView(x,y,pad){
+  return x > cam.x-pad && x < cam.x+W+pad && y > cam.y-pad && y < cam.y+H+pad;
+}
+function render(){
+  ctx.fillStyle='#b9a58c'; ctx.fillRect(0,0,W,H);
+
+  if(state==='playing' || state==='upgrade'){
+    ctx.save();
+    let sx=0, sy=0;
+    if(game.shake>0.2){ sx=(Math.random()-0.5)*game.shake; sy=(Math.random()-0.5)*game.shake; }
+    ctx.translate(-cam.x+sx, -cam.y+sy);
+
+    drawBackground();
+    drawEmbers();
+    for(const b of game.bushes){ if(inView(b.x,b.y,140)) drawBushBack(b); }
+
+    // 视锥剔除 + y 排序（decor / 路牌 / 怪 / 玩家 正确前后遮挡）
+    const drawList=[];
+    for(const d of game.decor){ if(inView(d.x,d.y,120)) drawList.push({ y:d.y, kind:'decor', ref:d }); }
+    // 场景名牌（各场景入口，木牌写场景名）
+    const sMin=Math.max(1,Math.floor(cam.x/SEG)), sMax=Math.min(Math.ceil(WW/SEG), Math.floor((cam.x+W)/SEG)+2);
+    for(let i=sMin;i<=sMax;i++){
+      const c=sceneEntry(i);
+      if(inView(c.x,c.y,90)) drawList.push({ y:c.y+22, kind:'sign', i });
+    }
+    for(const e of game.enemies){ if(e.dead) continue; drawList.push({ y:e.y+e.radius, kind:'enemy', ref:e }); }
+    drawList.push({ y:player.y+player.radius, kind:'player' });
+    drawList.sort((a,b)=>a.y-b.y);
+    for(const item of drawList){
+      if(item.kind==='decor') drawDecor(item.ref);
+      else if(item.kind==='sign') drawSceneSign(item.i);
+      else if(item.kind==='enemy') drawEnemy(item.ref);
+      else {
+        if(player.hidden){ ctx.save(); ctx.globalAlpha=0.6; }
+        drawPlayer();
+        if(player.hidden) ctx.restore();
+      }
+    }
+    // 传送阵（地面物，画在实体层之上、特效层之下，玩家可站上去）
+    for(let i=Math.max(1,game.floor-1); i<=game.floor+1; i++){
+      const pp=portalPos(i);
+      if(inView(pp.x,pp.y,110)) drawPortal(i);
+    }
+
+    for(const b of game.bushes){ if(inView(b.x,b.y,140)) drawBushFront(b); }
+    // 攻击范围圈（弱显示，隐蔽时也可见）
+    ctx.save();
+    ctx.setLineDash([10,16]);
+    ctx.strokeStyle='rgba(240,232,212,0.28)'; ctx.lineWidth=2.2;
+    ctx.beginPath(); ctx.arc(player.x,player.y,player.range,0,Math.PI*2); ctx.stroke();
+    ctx.setLineDash([]); ctx.restore();
+    drawDaggers();
+    for(const a of game.arrows) drawArrow(a);
+    for(const o of game.orbs) drawOrb(o);
+
+    for(const r of game.rings){
+      ctx.globalAlpha=clamp(r.life*2,0,1);
+      ctx.strokeStyle=r.color; ctx.lineWidth=3;
+      ctx.beginPath(); ctx.arc(r.x,r.y,r.r,0,Math.PI*2); ctx.stroke();
+    }
+    for(const p of game.particles){
+      ctx.globalAlpha=clamp(p.life*2,0,1);
+      ctx.fillStyle=p.color;
+      ctx.beginPath(); ctx.arc(p.x,p.y,3.4,0,Math.PI*2); ctx.fill();
+      ctx.lineWidth=1.4; ctx.strokeStyle=INK; ctx.stroke();
+    }
+    ctx.globalAlpha=1;
+
+    ctx.textAlign='center'; ctx.lineJoin='round';
+    for(const t of game.texts){
+      ctx.globalAlpha=clamp(t.life/0.7,0,1);
+      ctx.font=`bold ${t.size}px sans-serif`;
+      ctx.lineWidth=3.2; ctx.strokeStyle=INK; ctx.strokeText(t.text,t.x,t.y);
+      ctx.fillStyle=t.color; ctx.fillText(t.text,t.x,t.y);
+    }
+    ctx.globalAlpha=1; ctx.textAlign='left';
+
+    // ===== 全局手绘纹理叠加（水彩斑驳 + 纸张颗粒）=====
+    if(grainPat && blotPat){
+      ctx.globalCompositeOperation='overlay';
+      ctx.globalAlpha=0.62; ctx.fillStyle=blotPat; ctx.fillRect(cam.x-sx,cam.y-sy,W,H);
+      ctx.globalAlpha=0.5; ctx.fillStyle=grainPat; ctx.fillRect(cam.x-sx,cam.y-sy,W,H);
+      ctx.globalCompositeOperation='source-over'; ctx.globalAlpha=1;
+    }
+    ctx.restore();
+
+    // UI 也叠一层轻颗粒，保持统一
+    if(grainPat){
+      ctx.globalCompositeOperation='overlay'; ctx.globalAlpha=0.3;
+      ctx.fillStyle=grainPat; ctx.fillRect(0,0,W,H);
+      ctx.globalCompositeOperation='source-over'; ctx.globalAlpha=1;
+    }
+    drawHUD();
+  }
+
+  if(state==='start')    drawStart();
+  if(state==='upgrade')  drawUpgrade();
+  if(state==='gameover') drawGameOver();
+}
+
+// ---------- 背景：分场景底色 + 水彩斑驳 + 河流 + 小径 ----------
+function drawBackground(){
+  // 只画视野范围内的地面（世界是 30000 宽的长路）
+  const vx0=cam.x-120, vx1=cam.x+W+120;
+  // 按场景区段画底色（视野可能跨两个场景）
+  const s0=Math.floor(vx0/SEG), s1=Math.floor(vx1/SEG);
+  for(let s=s0;s<=s1;s++){
+    const idx=(((s % SCENES.length)+SCENES.length)%SCENES.length);
+    const x0=Math.max(vx0, s*SEG), x1=Math.min(vx1, (s+1)*SEG);
+    ctx.fillStyle=SCENES[idx].ground;
+    ctx.fillRect(x0-1, cam.y-140, x1-x0+2, H+280);
+    // 场景交界过渡带（轻压暗）
+    if(s>s0){
+      ctx.fillStyle='rgba(60,50,40,0.10)';
+      ctx.fillRect(x0-1, cam.y-140, 46, H+280);
+    }
+  }
+
+  // 水彩涂抹斑驳：每个由 3 个错位小斑组成，避免出现"正圆水渍"
+  for(const b of game.blots){
+    if(b.x<vx0-b.r || b.x>vx1+b.r) continue;
+    const g=ctx.createRadialGradient(b.x,b.y,0,b.x,b.y,b.r*0.8);
+    g.addColorStop(0, b.dark?'rgba(78,64,50,'+b.a+')':'rgba(245,236,214,'+(b.a+0.02)+')');
+    g.addColorStop(1,'rgba(0,0,0,0)');
+    ctx.fillStyle=g;
+    for(let k=0;k<3;k++){
+      const ox=(hash(b.x*0.01+k*13)-0.5)*b.r*0.62;
+      const oy=(hash(b.y*0.01+k*7)-0.5)*b.r*0.62;
+      wobbleCircle(b.x+ox,b.y+oy,b.r*(0.32+hash(b.x*0.02+k*3)*0.22),
+                   b.x*0.011+b.y*0.017+k,0.22,12);
+      ctx.fill();
+    }
+  }
+
+  // 硬边不规则豆状色块
+  for(const p of game.patches){
+    if(p.x<vx0-p.rx || p.x>vx1+p.rx) continue;
+    ctx.save(); ctx.translate(p.x,p.y); ctx.rotate(p.rot);
+    ctx.globalAlpha=p.a; ctx.fillStyle=p.c;
+    const s=p.rx,t=p.ry, k=p.seed;
+    ctx.beginPath();
+    ctx.moveTo(-s,0);
+    ctx.bezierCurveTo(-s,-t*(0.8+hash(k)*0.3), -s*0.3,-t, s*0.2,-t*(0.75+hash(k+1)*0.3));
+    ctx.bezierCurveTo(s*0.8,-t*0.7, s,-t*0.2, s*0.85,t*0.3);
+    ctx.bezierCurveTo(s*0.7,t, -s*0.2,t*0.95, -s*0.7,t*0.6);
+    ctx.bezierCurveTo(-s*1.05,t*0.35, -s,t*0.2, -s,0);
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+  ctx.globalAlpha=1;
+
+  // 低饱和地面裂纹 / 砖缝（手绘抖动细线）
+  ctx.lineCap='round';
+  for(const t of game.tiles){
+    if(t.x<vx0-t.len || t.x>vx1+t.len) continue;
+    ctx.strokeStyle='rgba(240,232,212,0.20)'; ctx.lineWidth=1.6;
+    ctx.beginPath();
+    ctx.moveTo(t.x,t.y);
+    ctx.quadraticCurveTo(t.x+Math.cos(t.a)*t.len*0.5+Math.sin(t.ph*3)*5,
+                         t.y+Math.sin(t.a)*t.len*0.5+Math.cos(t.ph*2)*5,
+                         t.x+Math.cos(t.a)*t.len, t.y+Math.sin(t.a)*t.len);
+    ctx.stroke();
+    ctx.strokeStyle='rgba(80,66,52,0.10)'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(t.x,t.y+1.5);
+    ctx.lineTo(t.x+Math.cos(t.a)*t.len, t.y+Math.sin(t.a)*t.len+1.5); ctx.stroke();
+  }
+
+  drawRivers(vx0, vx1);
+  drawRoad(vx0, vx1);
+  drawBridges(vx0, vx1);
+  drawBorder();
+}
+
+// ---------- 河流（穿过场景的蜿蜒水带，装饰） ----------
+function drawRivers(vx0, vx1){
+  for(const r of game.rivers){
+    if(r.base<vx0-200 || r.base>vx1+200) continue;
+    const sc=SCENES[r.seg % SCENES.length];
+    ctx.lineCap='round'; ctx.lineJoin='round';
+    const path=()=>{
+      ctx.beginPath();
+      for(let y=cam.y-60; y<=cam.y+H+60; y+=34){
+        const x=riverX(r,y);
+        if(y<=cam.y-60+1) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+      }
+    };
+    // 岸线 + 水面
+    path(); ctx.strokeStyle='rgba(90,78,62,0.30)'; ctx.lineWidth=r.w+10; ctx.stroke();
+    path(); ctx.strokeStyle=sc.river; ctx.lineWidth=r.w; ctx.stroke();
+    path(); ctx.strokeStyle='rgba(255,255,255,0.12)'; ctx.lineWidth=r.w*0.4; ctx.stroke();
+    // 波纹短线
+    ctx.strokeStyle='rgba(240,248,252,0.30)'; ctx.lineWidth=2.4;
+    for(let y=Math.ceil((cam.y-40)/90)*90; y<cam.y+H+40; y+=90){
+      const x=riverX(r,y);
+      ctx.beginPath(); ctx.moveTo(x-12,y); ctx.quadraticCurveTo(x,y-4,x+12,y); ctx.stroke();
+    }
+  }
+}
+
+// ---------- 木桥（河与路的交叉处） ----------
+function drawBridges(vx0, vx1){
+  for(const r of game.rivers){
+    for(const c of r.crossings){
+      if(c.x<vx0-120 || c.x>vx1+120) continue;
+      const ang=Math.atan2(roadY(c.x+10)-roadY(c.x-10), 20);
+      ctx.save(); ctx.translate(c.x,c.y); ctx.rotate(ang);
+      ctx.lineJoin='round'; ctx.lineCap='round';
+      ctx.fillStyle='rgba(80,66,52,0.16)';
+      ctx.beginPath(); ctx.ellipse(0,10,72,14,0,0,Math.PI*2); ctx.fill();
+      ctx.fillStyle='#a8825a';
+      wobbleRect(-66,-(ROAD_W/2+7),132,ROAD_W+14,6,1,0.03); ctx.fill();
+      OUTLINE(3.2); ctx.stroke();
+      ctx.strokeStyle='rgba(90,62,32,0.55)'; ctx.lineWidth=2.4;
+      for(let k=-2;k<=2;k++){
+        ctx.beginPath(); ctx.moveTo(-62,k*20); ctx.lineTo(62,k*20); ctx.stroke();
+      }
+      ctx.restore();
+    }
+  }
+}
+
+// ---------- 蜿蜒小径（弱化：不抢眼，只是隐约的路） ----------
+function drawRoad(vx0, vx1){
+  ctx.lineCap='round'; ctx.lineJoin='round';
+  const path=()=>{
+    ctx.beginPath();
+    for(let x=vx0; x<=vx1; x+=56){
+      const y=roadY(x);
+      if(x===vx0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    }
+  };
+  // 极淡的路缘（不做深描边带）
+  path(); ctx.strokeStyle='rgba(140,122,95,0.22)'; ctx.lineWidth=ROAD_W+8; ctx.stroke();
+  // 路面只比地面亮一点
+  path(); ctx.strokeStyle='#c6b697'; ctx.lineWidth=ROAD_W; ctx.stroke();
+  // 路面斑驳（浅/深硬边小斑）
+  ctx.fillStyle='rgba(150,128,96,0.13)';
+  for(let x=Math.ceil(vx0/150)*150; x<vx1; x+=150){
+    const y=roadY(x)+ (hash(x*0.013)-0.5)*ROAD_W*0.5;
+    ctx.beginPath(); ctx.ellipse(x,y,22+hash(x)*16,7+hash(x*2)*6,hash(x*3),0,Math.PI*2); ctx.fill();
+  }
+  // 淡淡的车辙
+  path(); ctx.setLineDash([14,34]); ctx.strokeStyle='rgba(140,118,88,0.16)'; ctx.lineWidth=3.5; ctx.stroke();
+  ctx.setLineDash([]);
+  // 零星小石子（很淡）
+  for(const st of game.roadStones){
+    if(st.x<vx0-10 || st.x>vx1+10) continue;
+    ctx.globalAlpha=0.5;
+    ctx.fillStyle=st.dark?'#a8946e':'#e0d4b2';
+    ctx.beginPath(); ctx.ellipse(st.x,st.y,st.s*0.8,st.s*0.6,st.x*0.05,0,Math.PI*2); ctx.fill();
+    ctx.globalAlpha=1;
+  }
+}
+
+// ---------- 场景名牌（入口木牌，写场景名） ----------
+function drawSceneSign(i){
+  const c = sceneEntry(i);
+  ctx.save(); ctx.translate(c.x,c.y); ctx.lineJoin='round'; ctx.lineCap='round';
+  ctx.fillStyle='rgba(80,66,52,0.15)';
+  ctx.beginPath(); ctx.ellipse(0,26,30,8,0,0,Math.PI*2); ctx.fill();
+  // 木杆
+  ctx.fillStyle='#8a6a48';
+  wobbleRect(-3.5,-4,7,32,2,1,0.04); ctx.fill();
+  OUTLINE(2.2); ctx.stroke();
+  // 牌板（当前场景牌稍亮）
+  const cur = i===game.floor;
+  ctx.fillStyle = cur ? '#e0cf94' : '#c4b48e';
+  wobbleRect(-52,-30,104,30,6,2,0.045); ctx.fill();
+  OUTLINE(cur?3.2:2.6); ctx.stroke();
+  ctx.fillStyle='rgba(255,250,232,0.32)';
+  ctx.fillRect(-48,-27,96,6);
+  ctx.fillStyle='#3c3630'; ctx.font='bold 14px sans-serif'; ctx.textAlign='center';
+  ctx.fillText(SCENES[sceneIdx(i)].name, 0, -9);
+  ctx.textAlign='left';
+  ctx.restore();
+}
+
+// ---------- 传送阵（清完场景后激活，站上传送） ----------
+function drawPortal(i){
+  const pp = portalPos(i);
+  const active = i===game.floor && game.cleared;
+  const nextSc = SCENES[sceneIdx(i+1)];
+  ctx.save(); ctx.translate(pp.x,pp.y); ctx.lineJoin='round'; ctx.lineCap='round';
+  ctx.fillStyle='rgba(80,66,52,0.16)';
+  ctx.beginPath(); ctx.ellipse(0,10,56,20,0,0,Math.PI*2); ctx.fill();
+  // 外圈石块
+  const n=9;
+  for(let k=0;k<n;k++){
+    const a=k/n*Math.PI*2 + (active ? time*0.7 : 0);
+    const gx=Math.cos(a)*44, gy=Math.sin(a)*44*0.82;
+    ctx.fillStyle = active ? '#b8ab90' : '#a8a094';
+    wobbleCircle(gx,gy,8.5,i*3+k,0.12,10); ctx.fill();
+    OUTLINE(2.4); ctx.stroke();
+  }
+  // 内圈符文底盘
+  ctx.fillStyle = active ? nextSc.river : '#9a948a';
+  ctx.globalAlpha = active ? 0.55 : 0.4;
+  ctx.beginPath(); ctx.arc(0,0,30,0,Math.PI*2); ctx.fill();
+  ctx.globalAlpha = 1;
+  OUTLINE(2.6); ctx.stroke();
+  // 符文刻痕（旋转虚线）
+  ctx.strokeStyle = active ? '#3c5a66' : '#7a7468';
+  ctx.lineWidth = 2.4;
+  ctx.setLineDash([7,9]);
+  ctx.beginPath(); ctx.arc(0,0,20,0,Math.PI*2); ctx.stroke();
+  ctx.setLineDash([]);
+  // 激活态：中心光点 + 上升粒子
+  if(active){
+    ctx.fillStyle='#f3ecd8';
+    const pu=1+0.25*Math.sin(time*4);
+    ctx.beginPath(); ctx.arc(0,-4,7*pu,0,Math.PI*2); ctx.fill();
+    ctx.lineWidth=2; ctx.strokeStyle=INK; ctx.stroke();
+    for(let k=0;k<4;k++){
+      const fy = ((time*26 + k*14) % 56);
+      ctx.globalAlpha = 0.75*(1 - fy/56);
+      ctx.beginPath(); ctx.arc(Math.sin(time*2+k*2)*10, -6-fy, 2.6, 0, Math.PI*2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+  ctx.restore();
+}
+
+function drawEmbers(){
+  for(const em of game.embers){
+    if(!inView(em.x,em.y,30)) continue;
+    ctx.globalAlpha=0.35+0.25*Math.sin(em.ph);
+    ctx.fillStyle=em.hue;
+    ctx.beginPath(); ctx.arc(em.x,em.y,em.r+0.6,0,Math.PI*2); ctx.fill();
+  }
+  ctx.globalAlpha=1;
+}
+
+// ---------- 装饰物（低饱和 + 细描边 + 表面斑点 + 手绘不规则）----------
+function drawDecor(d){
+  const {x,y,type,s,ph,seed}=d;
+  ctx.save(); ctx.translate(x,y); ctx.scale(s,s); ctx.lineJoin='round'; ctx.lineCap='round';
+  const sway=Math.sin(time*0.9+ph*3)*1.6;
+  if(type==='tree'){
+    ctx.fillStyle='rgba(80,66,52,0.16)';
+    ctx.beginPath(); ctx.ellipse(0,11,36,12,0,0,Math.PI*2); ctx.fill();
+    // 树干
+    ctx.fillStyle='#a08260';
+    ctx.beginPath();
+    ctx.moveTo(-10,12); ctx.quadraticCurveTo(-5,2,-5.5,-32);
+    ctx.lineTo(5.5,-32); ctx.quadraticCurveTo(5,2,10,12);
+    ctx.quadraticCurveTo(3,15,-10,12); ctx.closePath(); ctx.fill();
+    OUTLINE(2.8); ctx.stroke();
+    ctx.fillStyle='#7d6247';
+    ctx.beginPath(); ctx.moveTo(2,-30); ctx.quadraticCurveTo(6.5,0,9,11);
+    ctx.lineTo(4,12); ctx.quadraticCurveTo(2,0,1,-30); ctx.closePath(); ctx.fill();
+    // 树皮短线
+    ctx.strokeStyle='#6d5539'; ctx.lineWidth=1.5;
+    ctx.beginPath(); ctx.moveTo(-2,-26); ctx.lineTo(-2.6,-4); ctx.moveTo(3,-20); ctx.lineTo(2.8,-2); ctx.stroke();
+    // 云朵树冠：描边底 → 平涂 → 暗块 → 亮块
+    const lobes=[[0,-52,27],[-21,-44,19],[21,-44,19],[-32,-30,15],[32,-30,15],[0,-34,22],[-10,-62,16],[12,-60,15]];
+    ctx.fillStyle=INK;
+    for(const L of lobes){ wobbleCircle(L[0],L[1]+sway*0.3,L[2]+2.4,seed+L[0],0.09,12); ctx.fill(); }
+    ctx.fillStyle='#8fae86';
+    for(const L of lobes){ wobbleCircle(L[0],L[1]+sway*0.3,L[2],seed+L[0],0.09,12); ctx.fill(); }
+    ctx.fillStyle='#728b6b';
+    ctx.beginPath();
+    ctx.arc(16,-40+sway*0.3,17,0,Math.PI*2); ctx.arc(27,-30+sway*0.3,11,0,Math.PI*2);
+    ctx.arc(-2,-33+sway*0.3,13,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='#a9c49c';
+    ctx.beginPath(); ctx.arc(-16,-57+sway*0.3,11,0,Math.PI*2);
+    ctx.arc(-27,-35+sway*0.3,7,0,Math.PI*2); ctx.arc(6,-64+sway*0.3,8,0,Math.PI*2); ctx.fill();
+    // 表面斑点（手绘脏细节）
+    drawSpecks(0,-45,d.specks,'#6d8a66','#b6cbaa');
+    // 小扇叶
+    ctx.strokeStyle='#5f7a58'; ctx.lineWidth=1.8;
+    const ld=[[-12,-44],[10,-40],[-25,-32],[20,-30],[0,-58]];
+    for(let i=0;i<ld.length;i++){
+      const lx=ld[i][0], ly=ld[i][1]+sway*0.3, la=i*1.7+ph;
+      for(let k=-1;k<=1;k++){
+        ctx.beginPath(); ctx.moveTo(lx,ly);
+        ctx.quadraticCurveTo(lx+k*4,ly-6,lx+k*6+Math.sin(la+k)*1.5,ly-11); ctx.stroke();
+      }
+    }
+  } else if(type==='bush'){
+    ctx.fillStyle='rgba(80,66,52,0.14)'; ctx.beginPath(); ctx.ellipse(0,8,30,10,0,0,Math.PI*2); ctx.fill();
+    const parts=[[-17,1,15],[17,1,15],[0,-9,17],[0,5,13]];
+    ctx.fillStyle=INK;
+    for(const p of parts){ wobbleCircle(p[0],p[1],p[2]+2.4,seed+p[0],0.1,12); ctx.fill(); }
+    ctx.fillStyle='#8fae86';
+    for(const p of parts){ wobbleCircle(p[0],p[1],p[2],seed+p[0],0.1,12); ctx.fill(); }
+    ctx.fillStyle='#728b6b';
+    ctx.beginPath(); ctx.arc(10,0,12,0,Math.PI*2); ctx.arc(17,4,8,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='#a9c49c';
+    ctx.beginPath(); ctx.arc(-8,-14,7,0,Math.PI*2); ctx.arc(-13,-4,5,0,Math.PI*2); ctx.fill();
+    drawSpecks(0,-4,d.specks,'#6d8a66','#b6cbaa');
+    ctx.fillStyle='#c98a9e';
+    ctx.beginPath(); ctx.arc(-15,-3,3.2,0,Math.PI*2); ctx.arc(9,3,2.8,0,Math.PI*2); ctx.fill();
+    OUTLINE(1.6); ctx.stroke();
+  } else if(type==='rock'){
+    ctx.fillStyle='rgba(80,66,52,0.14)'; ctx.beginPath(); ctx.ellipse(0,8,20,7,0,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='#aab2bd';
+    ctx.beginPath();
+    ctx.moveTo(-19,8); ctx.quadraticCurveTo(-22,-6,-12,-14);
+    ctx.quadraticCurveTo(-2,-19,8,-15); ctx.quadraticCurveTo(21,-9,19,4);
+    ctx.quadraticCurveTo(18,9,10,9); ctx.lineTo(-12,9); ctx.closePath(); ctx.fill();
+    OUTLINE(2.8); ctx.stroke();
+    ctx.fillStyle='#8e97a5';
+    ctx.beginPath(); ctx.moveTo(-14,9); ctx.quadraticCurveTo(0,3,14,9); ctx.fill();
+    ctx.fillStyle='#d8dee6';
+    ctx.beginPath(); ctx.moveTo(-12,-13); ctx.quadraticCurveTo(-2,-17,7,-13); ctx.quadraticCurveTo(-2,-9,-12,-13); ctx.fill();
+    drawSpecks(0,-3,d.specks,'#8e97a5','#d8dee6');
+    ctx.strokeStyle=INK; ctx.lineWidth=1.8;
+    ctx.beginPath(); ctx.moveTo(-4,-6); ctx.lineTo(-1,-1); ctx.lineTo(-5,4); ctx.stroke();
+  } else if(type==='mushroom'){
+    ctx.fillStyle='rgba(80,66,52,0.13)'; ctx.beginPath(); ctx.ellipse(0,7,13,5,0,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='#e8dcc0';
+    ctx.beginPath(); ctx.moveTo(-4.5,7); ctx.quadraticCurveTo(-3.5,-8,-2,-15);
+    ctx.lineTo(3,-15); ctx.quadraticCurveTo(4,-4,5,7); ctx.closePath(); ctx.fill();
+    OUTLINE(2.6); ctx.stroke();
+    ctx.fillStyle='#c9bda0';
+    ctx.beginPath(); ctx.moveTo(1,-14); ctx.lineTo(4,-14); ctx.quadraticCurveTo(4,-4,5,7); ctx.lineTo(2,7); ctx.closePath(); ctx.fill();
+    ctx.fillStyle='#d98b7a';
+    ctx.beginPath(); ctx.moveTo(-17,-14); ctx.quadraticCurveTo(-16,-27,0,-28);
+    ctx.quadraticCurveTo(16,-27,17,-14); ctx.quadraticCurveTo(0,-10,-17,-14); ctx.closePath(); ctx.fill();
+    OUTLINE(2.8); ctx.stroke();
+    ctx.fillStyle='#b96f62';
+    ctx.beginPath(); ctx.moveTo(0,-11); ctx.quadraticCurveTo(10,-12,17,-14); ctx.quadraticCurveTo(0,-10,0,-11); ctx.fill();
+    ctx.fillStyle='#f3ece0'; ctx.lineWidth=1.6; ctx.strokeStyle=INK;
+    for(const spt of [[-7,-21,2.8],[5,-23,2.4],[10,-18,2]]){
+      ctx.beginPath(); ctx.arc(spt[0],spt[1],spt[2],0,Math.PI*2); ctx.fill(); ctx.stroke();
+    }
+  } else if(type==='flower'){
+    ctx.strokeStyle=INK; ctx.lineWidth=2.8;
+    ctx.beginPath(); ctx.moveTo(0,10); ctx.quadraticCurveTo(-1,0,0,-7); ctx.stroke();
+    ctx.strokeStyle='#728b6b'; ctx.lineWidth=1.5;
+    ctx.beginPath(); ctx.moveTo(0,10); ctx.quadraticCurveTo(-1,0,0,-7); ctx.stroke();
+    ctx.fillStyle='#8fae86'; ctx.lineWidth=1.8; ctx.strokeStyle=INK;
+    ctx.beginPath(); ctx.ellipse(-4,3,4.5,2.2,-0.6,0,Math.PI*2); ctx.fill(); ctx.stroke();
+    ctx.beginPath(); ctx.ellipse(4,6,4.5,2.2,0.6,0,Math.PI*2); ctx.fill(); ctx.stroke();
+    const pc=['#e8c96a','#dda1b8','#9dbcd0'][Math.floor(ph*3)%3];
+    ctx.fillStyle=pc; ctx.lineWidth=2; ctx.strokeStyle=INK;
+    for(let i=0;i<5;i++){
+      const a=i/5*Math.PI*2+ph;
+      ctx.beginPath(); ctx.ellipse(Math.cos(a)*5.5,-8+Math.sin(a)*5.5,4.6,3.2,a,0,Math.PI*2); ctx.fill(); ctx.stroke();
+    }
+    ctx.fillStyle='#f3ece0'; ctx.beginPath(); ctx.arc(0,-8,3.6,0,Math.PI*2); ctx.fill(); ctx.stroke();
+  } else {
+    const blades=[[-8,13,-14,-6],[0,14,-2,-14],[8,13,15,-4],[-4,13,-8,-12],[5,13,10,-13],[1,13,4,-18]];
+    for(let i=0;i<blades.length;i++){
+      const b=blades[i], bend=Math.sin(ph*2+i)*2.5;
+      ctx.strokeStyle=i%2===0?'#728b6b':'#8fae86'; ctx.lineWidth=i%2===0?3.6:2.6;
+      ctx.beginPath(); ctx.moveTo(b[0],b[1]);
+      ctx.quadraticCurveTo((b[0]+b[2])/2+bend,(b[1]+b[3])/2,b[2]+bend,b[3]); ctx.stroke();
+    }
+  }
+  ctx.restore();
+}
+
+function drawBorder(){
+  // 灰绿墙带 + 手绘斑驳（参考图青绿墙）
+  ctx.fillStyle='#9db2a4'; ctx.fillRect(0,0,WW,20); ctx.fillRect(0,WH-20,WW,20);
+  ctx.fillRect(0,0,20,WH); ctx.fillRect(WW-20,0,20,WH);
+  ctx.fillStyle='#b3c5b6'; ctx.fillRect(0,0,WW,7); ctx.fillRect(0,WH-7,WW,7);
+  ctx.fillRect(0,0,7,WH); ctx.fillRect(WW-7,0,7,WH);
+  for(const s of game.borderSpecks){
+    if(!inView(s.x,s.y,40)) continue;
+    ctx.fillStyle=s.dark?'rgba(90,110,95,0.14)':'rgba(235,240,225,0.12)';
+    ctx.beginPath(); ctx.ellipse(s.x,s.y,s.rx,s.ry,s.rot,0,Math.PI*2); ctx.fill();
+  }
+  ctx.strokeStyle=INK; ctx.lineWidth=3;
+  ctx.strokeRect(10,10,WW-20,WH-20);
+  ctx.fillStyle='#8a9c8e';
+  for(let x=30;x<WW;x+=90){ ctx.fillRect(x-8,3,16,14); ctx.strokeRect(x-8,3,16,14); ctx.fillRect(x-8,WH-17,16,14); ctx.strokeRect(x-8,WH-17,16,14); }
+  for(let y=30;y<WH;y+=90){ ctx.fillRect(3,y-8,14,16); ctx.strokeRect(3,y-8,14,16); ctx.fillRect(WW-17,y-8,14,16); ctx.strokeRect(WW-17,y-8,14,16); }
+}
+
+// ---------- 草丛（可躲藏区） ----------
+function drawBushBack(b){
+  // 只留很淡的中心草色，不画任何大圆盘/描边
+  ctx.save(); ctx.translate(b.x,b.y);
+  ctx.fillStyle='rgba(120,150,105,0.09)';
+  wobbleCircle(0,0,b.r*0.6,b.ph,0.22,14); ctx.fill();
+  ctx.restore();
+}
+function drawBushFront(b){
+  // 云朵状大叶球叠成一坨草丛：整团平涂 + 描边 + 亮部 + 叶脉 + 斑点
+  ctx.save(); ctx.translate(b.x,b.y); ctx.lineCap='round'; ctx.lineJoin='round';
+  if(b.lobes){
+    // 深色底，勾出整坨的外轮廓
+    for(const L of b.lobes){
+      const lx=Math.cos(L.a)*b.r*L.d, ly=Math.sin(L.a)*b.r*L.d*0.85;
+      ctx.fillStyle='#5f7a56';
+      wobbleCircle(lx,ly,L.r+2.5,L.ph,0.12,14); ctx.fill();
+    }
+    for(const L of b.lobes){
+      const lx=Math.cos(L.a)*b.r*L.d, ly=Math.sin(L.a)*b.r*L.d*0.85;
+      const sway=Math.sin(time*1.2+L.ph)*1.6, R=L.r;
+      ctx.fillStyle = L.tone===0 ? '#7d9a70' : '#93b487';
+      wobbleCircle(lx+sway,ly,R,L.ph,0.12,14); ctx.fill();
+      OUTLINE(2.4); ctx.stroke();
+      ctx.fillStyle = L.tone===0 ? '#9ab98c' : '#b4d0a2';
+      ctx.beginPath(); ctx.ellipse(lx-R*0.3+sway,ly-R*0.32,R*0.42,R*0.26,-0.5,0,Math.PI*2); ctx.fill();
+      ctx.strokeStyle='#5f7a56'; ctx.lineWidth=1.4;
+      ctx.beginPath(); ctx.moveTo(lx+sway,ly+R*0.3); ctx.lineTo(lx+sway,ly-R*0.55); ctx.stroke();
+      ctx.fillStyle='rgba(95,122,86,0.4)';
+      ctx.beginPath(); ctx.arc(lx+R*0.35+sway,ly+R*0.12,1.8,0,Math.PI*2);
+      ctx.arc(lx-R*0.2+sway,ly-R*0.4,1.3,0,Math.PI*2); ctx.fill();
+    }
+  }
+  ctx.restore();
+}
+
+// ---------- 玩家：海绵质感黄色方块弓箭手（低饱和手绘） ----------
+function drawPlayer(){
+  const px=player.x, py=player.y+Math.sin(player.bob*4)*1.5, r=player.radius;
+  // 绘制放大，让海绵质感与表情看得清（碰撞半径不变）
+  ctx.save();
+  ctx.translate(px,py); ctx.scale(1.45,1.45); ctx.translate(-px,-py);
+  ctx.fillStyle='rgba(80,66,52,0.18)';
+  ctx.beginPath(); ctx.ellipse(px,py+r*0.95,r*1.05,r*0.42,0,0,Math.PI*2); ctx.fill();
+
+  ctx.save(); ctx.translate(px,py); ctx.lineJoin='round'; ctx.lineCap='round';
+  // 灰蓝制服披风（在身体后）
+  ctx.fillStyle='#5b7d88';
+  ctx.beginPath();
+  ctx.moveTo(0,-r*1.0); ctx.quadraticCurveTo(r*1.2,-r*0.1,r*1.0,r*0.95);
+  ctx.quadraticCurveTo(0,r*1.2,-r*1.0,r*0.95);
+  ctx.quadraticCurveTo(-r*1.2,-r*0.1,0,-r*1.0); ctx.closePath(); ctx.fill();
+  OUTLINE(2.8); ctx.stroke();
+  ctx.fillStyle='#46646e';
+  ctx.beginPath(); ctx.moveTo(r*0.5,r*0.2); ctx.quadraticCurveTo(r*0.95,r*0.55,r*0.85,r*0.95);
+  ctx.quadraticCurveTo(r*0.35,r*1.1,0,r*1.12); ctx.quadraticCurveTo(r*0.45,r*0.6,r*0.5,r*0.2); ctx.closePath(); ctx.fill();
+  // 白领 + 领带
+  ctx.fillStyle='#f0ead8';
+  ctx.beginPath(); ctx.moveTo(-r*0.55,r*0.15); ctx.lineTo(0,r*0.5); ctx.lineTo(r*0.55,r*0.15);
+  ctx.lineTo(r*0.3,r*0.05); ctx.lineTo(-r*0.3,r*0.05); ctx.closePath(); ctx.fill();
+  OUTLINE(2.2); ctx.stroke();
+  ctx.fillStyle='#b98a72';
+  ctx.beginPath(); ctx.moveTo(0,r*0.42); ctx.lineTo(-2,r*0.85); ctx.lineTo(2,r*0.85); ctx.closePath(); ctx.fill();
+  OUTLINE(1.8); ctx.stroke();
+
+  // 黄色海绵身体（不规则圆角方 + 孔洞斑点）
+  const bw=r*1.02;
+  ctx.fillStyle=INK;
+  wobbleRect(-bw,-bw*1.05,bw*2,bw*2.1,r*0.32,5.3,0.055); ctx.fill();
+  ctx.fillStyle='#d9c95f';
+  wobbleRect(-bw+2,-bw*1.05+2,bw*2-4,bw*2.1-4,r*0.3,5.3,0.055); ctx.fill();
+  // 上侧亮块 / 下侧暗块（柔和）
+  ctx.fillStyle='#e6d878';
+  ctx.beginPath(); ctx.moveTo(-bw+3,-bw*1.05+3); ctx.lineTo(bw-3,-bw*1.05+3);
+  ctx.lineTo(bw-3,-bw*0.35); ctx.quadraticCurveTo(0,-bw*0.2,-bw+3,-bw*0.35); ctx.closePath(); ctx.fill();
+  ctx.fillStyle='#bfae4e';
+  ctx.beginPath(); ctx.moveTo(-bw+3,bw*0.55); ctx.quadraticCurveTo(0,bw*0.4,bw-3,bw*0.55);
+  ctx.lineTo(bw-3,bw*1.05-3); ctx.lineTo(-bw+3,bw*1.05-3); ctx.closePath(); ctx.fill();
+  // 海绵孔洞（关键质感）
+  drawSpecks(0,0,player.specks,'#a8a24a','#b8b25a');
+  OUTLINE(2.8); wobbleRect(-bw,-bw*1.05,bw*2,bw*2.1,r*0.32,5.3,0.055); ctx.stroke();
+
+  // 大眼（白 + 蓝瞳 + 高光 + 睫毛）
+  ctx.fillStyle='#f5f2e6';
+  ctx.beginPath(); ctx.ellipse(-r*0.24,-r*0.2,r*0.24,r*0.3,0,0,Math.PI*2);
+  ctx.ellipse(r*0.24,-r*0.2,r*0.24,r*0.3,0,0,Math.PI*2); ctx.fill();
+  OUTLINE(2.6); ctx.stroke();
+  ctx.fillStyle='#6e97a8';
+  ctx.beginPath(); ctx.arc(-r*0.2,-r*0.17,r*0.12,0,Math.PI*2);
+  ctx.arc(r*0.28,-r*0.17,r*0.12,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#3b4a52';
+  ctx.beginPath(); ctx.arc(-r*0.2,-r*0.17,r*0.065,0,Math.PI*2);
+  ctx.arc(r*0.28,-r*0.17,r*0.065,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#fff';
+  ctx.beginPath(); ctx.arc(-r*0.16,-r*0.23,r*0.04,0,Math.PI*2);
+  ctx.arc(r*0.32,-r*0.23,r*0.04,0,Math.PI*2); ctx.fill();
+  ctx.strokeStyle=INK; ctx.lineWidth=2;
+  for(const sx of [-1,1]){
+    ctx.beginPath(); ctx.moveTo(sx*r*0.42,-r*0.44); ctx.lineTo(sx*r*0.5,-r*0.56);
+    ctx.moveTo(sx*r*0.28,-r*0.48); ctx.lineTo(sx*r*0.3,-r*0.6); ctx.stroke();
+  }
+  // 笑嘴 + 两颗门牙
+  ctx.strokeStyle=INK; ctx.lineWidth=2.4;
+  ctx.beginPath(); ctx.arc(0,r*0.15,r*0.32,0.15*Math.PI,0.85*Math.PI); ctx.stroke();
+  ctx.fillStyle='#f5f2e6';
+  ctx.fillRect(-r*0.13,r*0.27,r*0.11,r*0.14); ctx.fillRect(r*0.02,r*0.27,r*0.11,r*0.14);
+  ctx.lineWidth=1.6; ctx.strokeRect(-r*0.13,r*0.27,r*0.11,r*0.14); ctx.strokeRect(r*0.02,r*0.27,r*0.11,r*0.14);
+  ctx.restore();
+
+  // 弓（木色 + 细描边）
+  const ang=player.aimAng;
+  const bx=px+Math.cos(ang)*(r*0.95), by=py+Math.sin(ang)*(r*0.95);
+  ctx.save(); ctx.translate(bx,by); ctx.rotate(ang);
+  const bowR=r+3;
+  ctx.lineWidth=6; ctx.strokeStyle=INK; ctx.lineCap='round';
+  ctx.beginPath(); ctx.arc(2,0,bowR,-1.2,1.2); ctx.stroke();
+  ctx.lineWidth=3.4; ctx.strokeStyle='#c9a86a'; ctx.stroke();
+  ctx.lineWidth=1.8; ctx.strokeStyle='#f0ead8';
+  ctx.beginPath(); ctx.moveTo(2+bowR*Math.cos(-1.2),bowR*Math.sin(-1.2));
+  ctx.lineTo(2+bowR*Math.cos(1.2),bowR*Math.sin(1.2)); ctx.stroke();
+  if(player.fireFlash>0){
+    ctx.globalAlpha=clamp(player.fireFlash/0.07,0,1);
+    const cx=bowR*0.7, fs=9;
+    ctx.fillStyle='#f0d878';
+    ctx.beginPath();
+    ctx.moveTo(cx+fs,0); ctx.quadraticCurveTo(cx+2,2,cx,fs);
+    ctx.quadraticCurveTo(cx-2,2,cx-fs,0); ctx.quadraticCurveTo(cx-2,-2,cx,-fs);
+    ctx.quadraticCurveTo(cx+2,-2,cx+fs,0); ctx.closePath(); ctx.fill();
+    ctx.lineWidth=2; ctx.strokeStyle=INK; ctx.stroke();
+    ctx.globalAlpha=1;
+  }
+  ctx.restore();
+
+  if(player.hitFlash>0){
+    ctx.globalAlpha=clamp(player.hitFlash/0.25,0,1);
+    ctx.lineWidth=7; ctx.strokeStyle='#c86a62';
+    ctx.beginPath(); ctx.arc(px,py,r+5,0,Math.PI*2); ctx.stroke();
+    ctx.globalAlpha=1;
+  }
+  ctx.restore();
+}
+// 不规则圆角矩形（手绘方块）
+function wobbleRect(x,y,w,h,r,seed,amp){
+  const k=amp||0.05;
+  ctx.beginPath();
+  ctx.moveTo(x+r,y+Math.sin(seed)*w*k);
+  ctx.lineTo(x+w-r,y+Math.sin(seed+1)*w*k);
+  ctx.quadraticCurveTo(x+w+Math.sin(seed+2)*w*k,y,x+w,y+r+Math.sin(seed+3)*h*k);
+  ctx.lineTo(x+w,y+h-r+Math.sin(seed+4)*w*k);
+  ctx.quadraticCurveTo(x+w,y+h,x+w-r,y+h+Math.sin(seed+5)*w*k);
+  ctx.lineTo(x+r,y+h+Math.sin(seed+6)*w*k);
+  ctx.quadraticCurveTo(x,y+h,x,y+h-r+Math.sin(seed+7)*h*k);
+  ctx.lineTo(x,y+r+Math.sin(seed+8)*h*k);
+  ctx.quadraticCurveTo(x,y,x+r,y+Math.sin(seed)*w*k);
+  ctx.closePath();
+}
+
+// ---------- 匕首 ----------
+function drawDaggers(){
+  const dg=player.weapon.daggers;
+  if(dg.count<=0) return;
+  ctx.save();
+  ctx.globalAlpha=dg.active?0.85:0.4;
+  ctx.strokeStyle=dg.active?(dg.evolved?'#e0c86a':'#8fb0b8'):'#9a9a92';
+  ctx.lineWidth=2.2; ctx.setLineDash([5,7]);
+  ctx.beginPath(); ctx.arc(player.x,player.y,dg.orbit,0,Math.PI*2); ctx.stroke();
+  ctx.setLineDash([]); ctx.restore();
+  if(!dg.active) return;
+  for(let i=0;i<dg.count;i++){
+    const a=player.daggerAngle+i*(Math.PI*2/dg.count);
+    drawKnife(player.x+Math.cos(a)*dg.orbit, player.y+Math.sin(a)*dg.orbit, a+Math.PI/2, dg.size, dg.evolved);
+  }
+}
+function drawKnife(px,py,ang,size,evolved){
+  ctx.save(); ctx.translate(px,py); ctx.rotate(ang); ctx.lineJoin='round'; ctx.lineCap='round';
+  const L=size*1.8;
+  ctx.fillStyle='#e2e6e2';
+  ctx.beginPath(); ctx.moveTo(L*0.55,0); ctx.quadraticCurveTo(L*0.1,-size,-L*0.45,-size*0.55);
+  ctx.lineTo(-L*0.62,0); ctx.quadraticCurveTo(-L*0.45,size*0.55,L*0.1,size); ctx.closePath(); ctx.fill();
+  ctx.fillStyle=evolved?'#e0c86a':'#aeb8c0';
+  ctx.beginPath(); ctx.moveTo(L*0.3,0); ctx.lineTo(L*0.3,size*0.34);
+  ctx.quadraticCurveTo(-L*0.2,size*0.6,-L*0.45,size*0.55); ctx.lineTo(-L*0.62,0); ctx.closePath(); ctx.fill();
+  OUTLINE(2.6);
+  ctx.beginPath(); ctx.moveTo(L*0.55,0); ctx.quadraticCurveTo(L*0.1,-size,-L*0.45,-size*0.55);
+  ctx.lineTo(-L*0.62,0); ctx.quadraticCurveTo(-L*0.45,size*0.55,L*0.1,size); ctx.closePath(); ctx.stroke();
+  ctx.strokeStyle='#f5f2e6'; ctx.lineWidth=1.5;
+  ctx.beginPath(); ctx.moveTo(L*0.45,-size*0.06); ctx.lineTo(-L*0.4,-size*0.06); ctx.stroke();
+  ctx.fillStyle=evolved?'#c9a24a':'#a08260'; ctx.fillRect(-L*0.62,-size*0.7,L*0.16,size*1.4);
+  ctx.lineWidth=2.2; ctx.strokeStyle=INK; ctx.strokeRect(-L*0.62,-size*0.7,L*0.16,size*1.4);
+  ctx.fillStyle=evolved?'#b08538':'#7a5c40'; ctx.fillRect(-L*0.9,-size*0.32,L*0.3,size*0.64);
+  ctx.strokeRect(-L*0.9,-size*0.32,L*0.3,size*0.64);
+  ctx.restore();
+}
+
+// ---------- 敌人（低饱和 + 表面斑点 + 手绘不规则） ----------
+function drawEnemy(e){
+  const bob=Math.sin(time*5+e.phase)*1.5;
+  // 钻地淡入：整体渐显 + 从土里升起
+  const sa = e.spawnT>0 ? clamp(1-e.spawnT/0.55,0,1) : 1;
+  const lift = (1-sa)*10;
+  ctx.globalAlpha = sa;
+  const ex=e.x, ey=e.y+bob - lift;
+  ctx.fillStyle='rgba(80,66,52,0.16)';
+  ctx.beginPath(); ctx.ellipse(e.x,e.y+e.radius*0.9,e.radius*0.95,e.radius*0.38,0,0,Math.PI*2); ctx.fill();
+  if(e.type==='rusher') drawRusher(e,ex,ey);
+  else if(e.type==='brute') drawBrute(e,ex,ey);
+  else drawGrunt(e,ex,ey);
+
+  if(e.hitFlash>0){
+    ctx.save(); ctx.globalAlpha=clamp(e.hitFlash/0.09,0,1)*0.75;
+    ctx.fillStyle='#fff6e2';
+    wobbleCircle(ex,ey,e.radius*1.2,e.seed,0.1,14); ctx.fill();
+    ctx.restore();
+  }
+  const bw=e.radius*2.3, hpw=bw*Math.max(0,e.hp/e.maxHp);
+  const hx=e.x-bw/2, hy=e.y-e.radius-14;
+  ctx.fillStyle='#5a4e42'; ctx.fillRect(hx,hy,bw,7);
+  ctx.fillStyle='#8fc46a'; ctx.fillRect(hx,hy,hpw,7);
+  ctx.fillStyle='#c3dda8'; ctx.fillRect(hx,hy,hpw,2);
+  ctx.lineWidth=1.8; ctx.strokeStyle=INK; ctx.strokeRect(hx,hy,bw,7);
+  // 等级标签（随场景增长，直观体现强度差异）
+  const lv = game.floor*2 - 1 + (e.type==='brute'?2:e.type==='rusher'?1:0);
+  ctx.font='bold 9px sans-serif'; ctx.textAlign='right'; ctx.lineJoin='round';
+  ctx.lineWidth=2.6; ctx.strokeStyle=INK; ctx.strokeText('Lv'+lv, hx-3, hy+6.5);
+  ctx.fillStyle='#f0d878'; ctx.fillText('Lv'+lv, hx-3, hy+6.5);
+  ctx.textAlign='left';
+  ctx.globalAlpha = 1;
+}
+// 粉红慵懒怪（参考图左）
+function drawGrunt(e,ex,ey){
+  const r=e.radius, sq=1+Math.sin(time*6+e.phase)*0.08;
+  ctx.save(); ctx.translate(ex,ey); ctx.scale(1/sq,sq); ctx.lineJoin='round'; ctx.lineCap='round';
+  ctx.fillStyle='#d99fbf';
+  wobbleCircle(0,0,r*1.02,e.seed,0.09,16); ctx.fill();
+  OUTLINE(2.8); ctx.stroke();
+  ctx.fillStyle='#b87fa2';
+  ctx.beginPath(); ctx.moveTo(-r,r*0.4); ctx.quadraticCurveTo(0,r*0.2,r,r*0.4);
+  ctx.quadraticCurveTo(r*0.7,r*0.9,0,r*0.9); ctx.quadraticCurveTo(-r*0.7,r*0.9,-r,r*0.4); ctx.closePath(); ctx.fill();
+  ctx.fillStyle='#ebc2d8';
+  ctx.beginPath(); ctx.ellipse(-r*0.35,-r*0.4,r*0.22,r*0.28,-0.4,0,Math.PI*2); ctx.fill();
+  drawSpecks(0,0,e.specks,'#c98aae','#ebc2d8');
+  // 半闭慵懒眼 + 睫毛
+  ctx.fillStyle='#f5f2e6';
+  ctx.beginPath(); ctx.ellipse(-r*0.32,-r*0.05,r*0.26,r*0.22,0,0,Math.PI*2);
+  ctx.ellipse(r*0.32,-r*0.05,r*0.26,r*0.22,0,0,Math.PI*2); ctx.fill();
+  OUTLINE(2.4); ctx.stroke();
+  ctx.fillStyle='#4a4038';
+  ctx.beginPath(); ctx.ellipse(-r*0.3,r*0.02,r*0.1,r*0.13,0,0,Math.PI*2);
+  ctx.ellipse(r*0.34,r*0.02,r*0.1,r*0.13,0,0,Math.PI*2); ctx.fill();
+  ctx.strokeStyle=INK; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(-r*0.58,-r*0.18); ctx.lineTo(-r*0.06,-r*0.18);
+  ctx.moveTo(r*0.06,-r*0.18); ctx.lineTo(r*0.58,-r*0.18); ctx.stroke();
+  for(const sx of [-1,1]) for(let k=0;k<3;k++){
+    ctx.beginPath(); ctx.moveTo(sx*(r*0.2+k*r*0.14),-r*0.22);
+    ctx.lineTo(sx*(r*0.22+k*r*0.14),-r*0.34); ctx.stroke();
+  }
+  // 厚嘴
+  ctx.fillStyle='#b87fa2';
+  ctx.beginPath(); ctx.ellipse(0,r*0.4,r*0.3,r*0.16,0,0,Math.PI*2); ctx.fill();
+  OUTLINE(2.2); ctx.stroke();
+  ctx.strokeStyle='#8f5f7c'; ctx.lineWidth=1.4;
+  ctx.beginPath(); ctx.moveTo(-r*0.2,r*0.4); ctx.lineTo(r*0.2,r*0.4); ctx.stroke();
+  ctx.restore();
+}
+// 珊瑚橙小恶魔（朝玩家冲）
+function drawRusher(e,ex,ey){
+  const r=e.radius, a=Math.atan2(player.y-e.y,player.x-e.x);
+  ctx.save(); ctx.translate(ex,ey); ctx.rotate(a); ctx.lineJoin='round'; ctx.lineCap='round';
+  const flap=Math.sin(time*16+e.phase)*0.5;
+  for(const s of [1,-1]){
+    ctx.save(); ctx.scale(1,s);
+    ctx.fillStyle='#b56a6a';
+    ctx.beginPath(); ctx.moveTo(0,-r*0.1);
+    ctx.quadraticCurveTo(-r*1.6,-r*0.5-r*flap,-r*2.0,r*0.1);
+    ctx.quadraticCurveTo(-r*1.3,r*0.05,-r*0.4,r*0.35); ctx.closePath(); ctx.fill();
+    OUTLINE(2.4); ctx.stroke();
+    ctx.fillStyle='#985454';
+    ctx.beginPath(); ctx.moveTo(-r*0.4,r*0.35);
+    ctx.quadraticCurveTo(-r*1.3,r*0.05,-r*2.0,r*0.1);
+    ctx.quadraticCurveTo(-r*1.2,r*0.28,-r*0.4,r*0.35); ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+  ctx.fillStyle='#e0a07c';
+  ctx.beginPath(); ctx.moveTo(r,0); ctx.quadraticCurveTo(r*0.2,-r,-r*0.6,-r*0.6);
+  ctx.quadraticCurveTo(-r,-r*0.2,-r*0.6,r*0.6); ctx.quadraticCurveTo(r*0.2,r,r,0); ctx.closePath(); ctx.fill();
+  OUTLINE(2.8); ctx.stroke();
+  ctx.fillStyle='#eec09e';
+  ctx.beginPath(); ctx.moveTo(r,0); ctx.quadraticCurveTo(r*0.2,-r,-r*0.6,-r*0.6);
+  ctx.quadraticCurveTo(-r*0.1,-r*0.5,r,0); ctx.closePath(); ctx.fill();
+  ctx.fillStyle='#c07f5e';
+  ctx.beginPath(); ctx.moveTo(r,0); ctx.quadraticCurveTo(r*0.2,r,-r*0.6,r*0.6);
+  ctx.quadraticCurveTo(-r*0.1,r*0.35,r,0); ctx.closePath(); ctx.fill();
+  drawSpecks(-r*0.1,0,e.specks,'#c07f5e','#eec09e');
+  // 角
+  ctx.fillStyle='#e8c96a';
+  ctx.beginPath(); ctx.moveTo(-r*0.2,-r*0.6); ctx.lineTo(-r*0.05,-r*1.1); ctx.lineTo(r*0.05,-r*0.6); ctx.closePath(); ctx.fill(); OUTLINE(2); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(r*0.2,-r*0.6); ctx.lineTo(r*0.35,-r*1.1); ctx.lineTo(r*0.45,-r*0.5); ctx.closePath(); ctx.fill(); ctx.stroke();
+  // 眼
+  ctx.fillStyle='#f5f2e6';
+  ctx.beginPath(); ctx.arc(r*0.1,-r*0.1,r*0.2,0,Math.PI*2);
+  ctx.arc(-r*0.34,-r*0.1,r*0.2,0,Math.PI*2); ctx.fill(); OUTLINE(2.2); ctx.stroke();
+  ctx.fillStyle='#4a4038';
+  ctx.beginPath(); ctx.arc(r*0.14,-r*0.08,r*0.09,0,Math.PI*2);
+  ctx.arc(-r*0.3,-r*0.08,r*0.09,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#fff';
+  ctx.beginPath(); ctx.arc(r*0.17,-r*0.12,r*0.035,0,Math.PI*2); ctx.arc(-r*0.27,-r*0.12,r*0.035,0,Math.PI*2); ctx.fill();
+  // 尖牙
+  ctx.fillStyle='#f5f2e6';
+  ctx.beginPath(); ctx.moveTo(-r*0.1,r*0.12); ctx.lineTo(r*0.1,r*0.12); ctx.lineTo(0,r*0.34); ctx.closePath(); ctx.fill();
+  ctx.lineWidth=1.8; ctx.strokeStyle=INK; ctx.stroke();
+  ctx.restore();
+}
+// 灰紫重甲怪（参考图右）
+function drawBrute(e,ex,ey){
+  const r=e.radius;
+  ctx.save(); ctx.translate(ex,ey); ctx.lineJoin='round'; ctx.lineCap='round';
+  ctx.fillStyle='#b9a3d4';
+  wobbleCircle(0,0,r*1.05,e.seed,0.07,18); ctx.fill();
+  OUTLINE(3); ctx.stroke();
+  ctx.fillStyle='#cdbae2';
+  ctx.beginPath(); ctx.arc(0,-r*0.2,r*0.85,Math.PI,0); ctx.quadraticCurveTo(0,-r*0.35,-r*0.85,-r*0.2); ctx.fill();
+  ctx.fillStyle='#927cba';
+  ctx.beginPath(); ctx.moveTo(-r,r*0.3); ctx.quadraticCurveTo(0,r*0.05,r,r*0.3);
+  ctx.quadraticCurveTo(r*0.6,r*0.95,0,r*0.95); ctx.quadraticCurveTo(-r*0.6,r*0.95,-r,r*0.3); ctx.closePath(); ctx.fill();
+  drawSpecks(0,-r*0.1,e.specks,'#927cba','#cdbae2');
+  // 护甲缝线
+  ctx.strokeStyle='#8a74ae'; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(-r*0.7,r*0.1); ctx.lineTo(-r*0.5,r*0.6);
+  ctx.moveTo(r*0.7,r*0.1); ctx.lineTo(r*0.5,r*0.6); ctx.moveTo(0,-r*0.1); ctx.lineTo(0,r*0.1); ctx.stroke();
+  // 银肩甲
+  for(const sx of [-r*0.85,r*0.85]){
+    ctx.fillStyle='#cfd4dc'; wobbleCircle(sx,-r*0.15,r*0.4,e.seed+sx,0.08,12); ctx.fill(); OUTLINE(2.4); ctx.stroke();
+    ctx.fillStyle='#a9b0bc';
+    ctx.beginPath(); ctx.arc(sx,0,r*0.25,0,Math.PI); ctx.fill();
+    ctx.lineWidth=1.8; ctx.strokeStyle=INK; ctx.beginPath(); ctx.arc(sx,0,r*0.25,0,Math.PI); ctx.stroke();
+  }
+  // 大眼 + 皱眉
+  ctx.fillStyle='#f5f2e6';
+  ctx.beginPath(); ctx.arc(-r*0.2,-r*0.45,r*0.23,0,Math.PI*2);
+  ctx.arc(r*0.2,-r*0.45,r*0.23,0,Math.PI*2); ctx.fill(); OUTLINE(2.4); ctx.stroke();
+  ctx.fillStyle='#4a4038';
+  ctx.beginPath(); ctx.arc(-r*0.16,-r*0.42,r*0.1,0,Math.PI*2);
+  ctx.arc(r*0.24,-r*0.42,r*0.1,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#fff';
+  ctx.beginPath(); ctx.arc(-r*0.12,-r*0.47,r*0.035,0,Math.PI*2); ctx.arc(r*0.28,-r*0.47,r*0.035,0,Math.PI*2); ctx.fill();
+  ctx.strokeStyle=INK; ctx.lineWidth=3;
+  ctx.beginPath(); ctx.moveTo(-r*0.45,-r*0.72); ctx.lineTo(-r*0.03,-r*0.58);
+  ctx.moveTo(r*0.45,-r*0.72); ctx.lineTo(r*0.03,-r*0.58); ctx.stroke();
+  // 厚嘴
+  ctx.fillStyle='#8f6c9e';
+  ctx.beginPath(); ctx.ellipse(0,r*0.4,r*0.28,r*0.15,0,0,Math.PI*2); ctx.fill();
+  OUTLINE(2.2); ctx.stroke();
+  ctx.strokeStyle='#6d5080'; ctx.lineWidth=1.4;
+  ctx.beginPath(); ctx.moveTo(-r*0.18,r*0.4); ctx.lineTo(r*0.18,r*0.4); ctx.stroke();
+  ctx.restore();
+}
+
+// ---------- 箭（木色 + 细描边 + 手绘速度线） ----------
+function drawArrow(a){
+  const ang=Math.atan2(a.vy,a.vx), evo=a.color==='#c86a52';
+  ctx.save(); ctx.translate(a.x,a.y); ctx.rotate(ang); ctx.lineJoin='round'; ctx.lineCap='round';
+  const len=evo?18:14;
+  ctx.strokeStyle=evo?'#d8a08a':'#e0d0a8'; ctx.lineWidth=2;
+  for(const off of [-4,0,4]){ ctx.beginPath(); ctx.moveTo(-len-8,off*0.6); ctx.lineTo(-len-2,off*0.6); ctx.stroke(); }
+  ctx.lineWidth=(evo?4:3)+2.6; ctx.strokeStyle=INK;
+  ctx.beginPath(); ctx.moveTo(-len,0); ctx.lineTo(len*0.4,0); ctx.stroke();
+  ctx.lineWidth=evo?4:3; ctx.strokeStyle='#c9a86a';
+  ctx.beginPath(); ctx.moveTo(-len,0); ctx.lineTo(len*0.4,0); ctx.stroke();
+  ctx.fillStyle=a.color;
+  ctx.beginPath(); ctx.moveTo(len*0.55,0); ctx.lineTo(len*0.4,-5); ctx.lineTo(len*0.4,5); ctx.closePath(); ctx.fill();
+  ctx.lineWidth=2; ctx.strokeStyle=INK; ctx.stroke();
+  ctx.strokeStyle='#f0ead8'; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(-len,0); ctx.lineTo(-len+6,-5); ctx.moveTo(-len,0); ctx.lineTo(-len+6,5); ctx.stroke();
+  ctx.restore();
+}
+// ---------- 经验光点（柔和绿圆点，飞向经验条） ----------
+function drawOrb(o){
+  const pulse=1+0.2*Math.sin(time*8+o.phase), r=o.radius*pulse;
+  ctx.fillStyle='rgba(140,205,90,0.35)';
+  ctx.beginPath(); ctx.arc(o.x,o.y,r*2,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#8fc46a';
+  ctx.beginPath(); ctx.arc(o.x,o.y,r,0,Math.PI*2); ctx.fill();
+  ctx.lineWidth=2; ctx.strokeStyle=INK; ctx.stroke();
+  ctx.fillStyle='#eaf5d8';
+  ctx.beginPath(); ctx.arc(o.x-r*0.3,o.y-r*0.3,r*0.3,0,Math.PI*2); ctx.fill();
+}
+
+// ---------- HUD（低饱和纸质 + 细描边） ----------
+function drawHUD(){
+  const bx=16, by=16, bw=210, bh=18;
+  ctx.fillStyle='rgba(238,230,210,0.82)'; roundRect(bx-4,by-4,bw+8,bh+8,7); ctx.fill();
+  ctx.lineWidth=2; ctx.strokeStyle=INK; ctx.stroke();
+  const ratio=clamp(player.hp/player.maxHp,0,1);
+  ctx.fillStyle='#6b5c4e'; ctx.fillRect(bx,by,bw,bh);
+  ctx.fillStyle='#c07a72'; ctx.fillRect(bx,by,bw*ratio,bh);
+  ctx.fillStyle='#dca89c'; ctx.fillRect(bx,by,bw*ratio,4);
+  ctx.strokeStyle=INK; ctx.lineWidth=2; ctx.strokeRect(bx,by,bw,bh);
+  hudText(`HP ${Math.ceil(player.hp)}/${player.maxHp}`,bx+6,by+13,'#fff6e2',12,'left');
+
+  const xby=by+bh+8, xbh=10;
+  hudText(`Lv${game.level}`,bx,xby+9,'#f0d878',12,'left');
+  ctx.fillStyle='#3c4a38'; ctx.fillRect(bx+40,xby,bw-40,xbh);
+  ctx.fillStyle='#8fc46a'; ctx.fillRect(bx+40,xby,(bw-40)*clamp(game.xp/game.xpNeed,0,1),xbh);
+  ctx.strokeStyle=INK; ctx.lineWidth=1.8; ctx.strokeRect(bx+40,xby,bw-40,xbh);
+
+  const w=player.weapon;
+  hudText(`弓 Lv${w.level}${w.evolved?' ★':''} · 连发${w.burst} 数量${w.count} 分裂${w.split} 箭伤${Math.round(w.damage)} 射程${Math.round(player.range)}`,bx,84,'#e6f0ea',12,'left');
+  hudText(`匕首 Lv${w.daggers.level}${w.daggers.evolved?' ★':''} · x${w.daggers.count}`,bx,102,'#f0d878',12,'left');
+  const dg=w.daggers;
+  if(dg.count>0){
+    const maxd=dg.active?dg.duration:dg.interval, dr=clamp(dg.timer/maxd,0,1);
+    const barx=bx,bary=110,barw=130,barh=6;
+    ctx.fillStyle='#4a4038'; ctx.fillRect(barx,bary,barw,barh);
+    ctx.fillStyle=dg.active?'#e0c86a':'#9a9a92'; ctx.fillRect(barx,bary,barw*dr,barh);
+    ctx.strokeStyle=INK; ctx.lineWidth=1.6; ctx.strokeRect(barx,bary,barw,barh);
+    hudText(dg.active?'匕首旋转中':'匕首冷却中',barx+barw+6,bary+6,'#fff6e2',11,'left');
+  }
+  hudText(game.cleared ? '传送阵已激活 · 可随时传送' : `击杀进度 ${game.slain}/${game.quota}`,16,64,game.cleared?'#a9d49a':'#fff6e2',12,'left');
+  hudText(game.cleared ? '怪物仍在刷新 · 杀穿或直接走传送阵' : '杀满配额激活传送阵 · 怪物持续刷新',16,82,'#f0d878',11,'left');
+  hudText(`第 ${game.floor} 关 · ${SCENES[sceneIdx(game.floor)].name}`,W-16,28,'#fff6e2',14,'right');
+  hudText(`击杀 ${game.kills}`,W-16,48,'#f0d878',13,'right');
+  hudText(`得分 ${game.score}`,W-16,66,'#f0d878',13,'right');
+  hudText(`暴击 ${Math.round(player.critRate*100)}% / x${player.critDmg.toFixed(2)}`,W-16,86,'#f0d878',13,'right');
+
+  if(game.evoTimer>0){
+    ctx.globalAlpha=clamp(game.evoTimer,0,1);
+    hudText(game.evoMsg,W/2,140,'#f0d878',32,'center');
+    ctx.globalAlpha=1;
+  }
+  // 进入新场景：场景名横幅
+  if(game.sceneTimer>0){
+    ctx.globalAlpha=clamp(game.sceneTimer,0,1);
+    ctx.textAlign='center';
+    ctx.font='bold 30px sans-serif'; ctx.lineWidth=6; ctx.strokeStyle=INK; ctx.lineJoin='round';
+    ctx.strokeText(game.sceneMsg, W/2, 208);
+    ctx.fillStyle='#f3ecd8'; ctx.fillText(game.sceneMsg, W/2, 208);
+    ctx.font='bold 13px sans-serif'; ctx.lineWidth=4;
+    const sub=`第 ${game.floor} 关 · 怪物等级提升`;
+    ctx.strokeText(sub, W/2, 234);
+    ctx.fillStyle='#e6dcc8'; ctx.fillText(sub, W/2, 234);
+    ctx.textAlign='left'; ctx.globalAlpha=1;
+  }
+  if(player.hidden) hudText('🌿 已隐蔽 · 怪物迷失中 · 已停手',W/2,26,'#a9d49a',15,'center');
+}
+function hudText(txt,x,y,color,size,align){
+  ctx.textAlign=align||'left'; ctx.font=`bold ${size}px sans-serif`;
+  ctx.lineWidth=3; ctx.strokeStyle=INK; ctx.lineJoin='round';
+  ctx.strokeText(txt,x,y); ctx.fillStyle=color; ctx.fillText(txt,x,y);
+  ctx.textAlign='left';
+}
+function roundRect(x,y,w,h,r){
+  ctx.beginPath(); ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r);
+  ctx.arcTo(x+w,y+h,x,y+h,r); ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath();
+}
+
+// ---------- 界面 ----------
+function drawStart(){
+  ctx.fillStyle='rgba(90,80,72,0.86)'; ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center';
+  bigText('🏹 弓箭肉鸽',W/2,H/2-70,38,'#e4d488');
+  bigText('弓箭自动锁敌连射，你只管走位。词条只强化武器，满 5 级进化。',W/2,H/2-30,15,'#f3ece0');
+  bigText('WASD 移动 · 清完场景怪物激活传送阵 · 站上传送进入下一场景',W/2,H/2,15,'#d8ccb8');
+  bigText('点击屏幕 / 按空格 开始',W/2,H/2+50,20,'#a9d49a');
+  ctx.textAlign='left';
+}
+function bigText(t,x,y,size,color){
+  ctx.font=`bold ${size}px sans-serif`; ctx.lineWidth=size>24?6:3.5;
+  ctx.strokeStyle=INK; ctx.lineJoin='round';
+  ctx.strokeText(t,x,y); ctx.fillStyle=color; ctx.fillText(t,x,y);
+}
+function drawUpgrade(){
+  ctx.fillStyle='rgba(90,80,72,0.84)'; ctx.fillRect(0,0,W,H);
+  bigText(`升级！等级 ${game.level} · 选择一项武器强化`,W/2,170,26,'#f3ece0');
+  const boxW=240,boxH=175,gap=24,startX=(W-(boxW*3+gap*2))/2,y=250;
+  game.upgradeRects=[];
+  game.upgradeChoices.forEach((up,i)=>{
+    const x=startX+i*(boxW+gap);
+    game.upgradeRects.push({x,y,w:boxW,h:boxH,up});
+    const hover=mouse.x>=x&&mouse.x<=x+boxW&&mouse.y>=y&&mouse.y<=y+boxH;
+    let accent='#b98ab0'; if(up.cat==='bow') accent='#6b95a3'; else if(up.cat==='dagger') accent='#c9a24a';
+    if(up.rare) accent='#d9a75c';                 // 稀有档用金色带
+    // 米白纸卡 + 细深棕描边（稀有档更亮、描边更粗）
+    ctx.fillStyle=hover?'#f6efd8':(up.rare?'#f4eacb':'#eae1c8'); roundRect(x,y,boxW,boxH,12); ctx.fill();
+    ctx.lineWidth=up.rare?4.5:3; ctx.strokeStyle=INK; ctx.stroke();
+    ctx.fillStyle=accent; roundRect(x+7,y+7,boxW-14,40,8); ctx.fill();
+    ctx.lineWidth=2.2; ctx.strokeStyle=INK; ctx.stroke();
+    ctx.textAlign='center'; ctx.fillStyle='#3c3630'; ctx.font='bold 14px sans-serif';
+    const catLabel=(up.cat==='global'?'全局':(up.cat==='bow'?'弓箭':'匕首'))+(up.rare?' · 稀有':'');
+    ctx.fillText(catLabel,x+boxW/2,y+33);
+    ctx.fillStyle='#3c3630'; ctx.font='bold 24px sans-serif'; ctx.fillText(up.name,x+boxW/2,y+95);
+    ctx.fillStyle='#6b6055'; ctx.font='bold 14px sans-serif';
+    wrapText(up.desc,x+boxW/2,y+128,boxW-30,20);
+  });
+  ctx.textAlign='left';
+}
+function wrapText(text,cx,cy,maxW,lh){
+  let line='',yy=cy;
+  for(const ch of text){
+    if(ctx.measureText(line+ch).width>maxW){ ctx.fillText(line,cx,yy); line=ch; yy+=lh; }
+    else line+=ch;
+  }
+  ctx.fillText(line,cx,yy);
+}
+function drawGameOver(){
+  ctx.fillStyle='rgba(90,80,72,0.88)'; ctx.fillRect(0,0,W,H);
+  bigText('💀 你倒下了',W/2,H/2-90,36,'#d99a92');
+  bigText(`到达第 ${game.floor} 关 · 等级 ${game.level}`,W/2,H/2-40,17,'#f3ece0');
+  bigText(`弓 Lv${player.weapon.level} · 匕首 Lv${player.weapon.daggers.level}`,W/2,H/2-10,15,'#e4d488');
+  bigText(`击杀 ${game.kills} · 得分 ${game.score}`,W/2,H/2+20,15,'#f3ece0');
+  bigText('点击 / 按空格 重新开始',W/2,H/2+70,20,'#a9d49a');
+}
+
+// ---------- 主循环 ----------
+makeTextures();
+// 调试用：直接进游戏并在玩家周围摆几只怪，方便截图核对角色造型；正常打开无影响
+if(location.hash==='#autostart'){
+  startGame();
+  const demo=[['grunt',-135,-55],['grunt',145,70],['rusher',55,-150],['rusher',-70,155],['brute',205,-40],['brute',-190,120]];
+  for(const [t,dx,dy] of demo){
+    const base=ENEMY_TYPES[t];
+    game.enemies.push({ type:t, x:player.x+dx, y:player.y+dy, radius:base.radius, color:base.color,
+      hp:99999, maxHp:99999, speed:0, damage:0, attackTimer:999, daggerCd:0,
+      hitFlash:0, dead:false, phase:Math.random()*6.28,
+      wandering:false, wanderTimer:999, wx:0, wy:0, seed:Math.random()*30,
+      specks:makeSpecks(9,base.radius*0.8,Math.random()*70) });
+  }
+  // 调试态：保留正常刷怪（可观察钻地淡入与群/独分布），demo 怪高血量不死
+}
+// 验收用：直接展示三张连发词条卡；正常打开无影响
+if(location.hash==='#showupgrade'){
+  startGame();
+  state='upgrade';
+  game.upgradeChoices=['burst','burst2','burst3'].map(id=>UPGRADES.find(u=>u.id===id));
+}
+let last=performance.now();
+function loop(now){
+  let dt=(now-last)/1000; last=now;
+  if(dt>0.05) dt=0.05;
+  update(dt);
+  render();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
